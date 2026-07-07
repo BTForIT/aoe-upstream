@@ -55,6 +55,13 @@ const PAGES = [
       "Run AI coding agents in isolated Docker containers with Agent of Empires.",
   },
   {
+    source: "docs/guides/pane-rules.md",
+    dest: "guides/pane-rules.md",
+    title: "Pane Rules",
+    description:
+      "Watch session output for configurable text patterns and run commands on match.",
+  },
+  {
     source: "docs/guides/tmux-status-bar.md",
     dest: "guides/tmux-status-bar.md",
     title: "tmux Status Bar",
@@ -417,6 +424,7 @@ const URL_MAP = {
   "docs/guides/repo-config.md": "/guides/repo-config/",
   "docs/guides/mcp-servers.md": "/guides/mcp-servers/",
   "docs/guides/sandbox.md": "/guides/sandbox/",
+  "docs/guides/pane-rules.md": "/guides/pane-rules/",
   "docs/guides/tmux-status-bar.md": "/guides/tmux-status-bar/",
   "docs/guides/web-dashboard.md": "/guides/web-dashboard/",
   "docs/guides/web/dashboard.md": "/guides/web/dashboard/",

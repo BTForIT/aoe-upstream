@@ -12,6 +12,7 @@ pub mod auth;
 pub mod live_ws;
 pub mod login;
 mod pane;
+mod pane_watchdog;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
@@ -1068,6 +1069,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // status seeding plus the synchronous recovery marking (so that first tick's
     // session counts reflect the restored state rather than a half-loaded one).
     spawn_serve_snapshot_loop(state.clone());
+
+    // Pane watchdog: user-configured pane-text rules (config `[watchdog]`).
+    // No-op unless rules are configured; skipped in read-only mode since it
+    // runs user commands.
+    pane_watchdog::spawn(state.clone());
 
     // GC the recently_restarted suppression map periodically; the TTL
     // check on read filters but does not remove entries. Without this,

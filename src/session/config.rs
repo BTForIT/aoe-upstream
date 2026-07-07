@@ -67,6 +67,10 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
 
+    /// Pane watchdog: daemon-side pane-text rules (see docs/guides/pane-rules.md).
+    #[serde(default)]
+    pub watchdog: crate::pane_rules::WatchdogConfig,
+
     /// Environment variables injected into the host command line for every
     /// session spawned at global scope. Entries are `KEY=value`, `KEY=$VAR`
     /// (read VAR from the host env), `KEY=$$literal` (escape a `$`), or
