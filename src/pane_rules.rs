@@ -123,13 +123,24 @@ pub struct CompiledRule {
 }
 
 /// Compile a rule list, dropping disabled entries and (with a warning) any
-/// rule whose pattern or guards fail to parse. The result is sorted by
-/// `priority` (stable, so config order breaks ties).
+/// rule whose pattern or guards fail to parse, plus later duplicates of a
+/// `name` already seen — the watchdog's cooldown map is keyed by rule name,
+/// so duplicates would share (and corrupt) each other's cooldown state.
+/// The result is sorted by `priority` (stable, so config order breaks ties).
 pub fn compile(rules: &[PaneRuleConfig]) -> Vec<CompiledRule> {
+    let mut seen_names = std::collections::HashSet::new();
     let mut compiled: Vec<CompiledRule> = rules
         .iter()
         .filter(|r| r.enabled)
         .filter_map(|r| {
+            if !seen_names.insert(r.name.clone()) {
+                tracing::warn!(
+                    target: "pane_rules",
+                    rule = %r.name,
+                    "duplicate rule name; rule dropped"
+                );
+                return None;
+            }
             let pattern = match Regex::new(&r.pattern) {
                 Ok(p) => p,
                 Err(e) => {
@@ -302,6 +313,19 @@ mod tests {
         assert_eq!(compiled.len(), 2);
         assert_eq!(compiled[0].name, "first");
         assert_eq!(compiled[1].name, "second");
+    }
+
+    #[test]
+    fn compile_drops_duplicate_names_keeps_first() {
+        let mut a = rule("dup", "^first$");
+        a.cooldown_secs = 60;
+        let mut b = rule("dup", "^second$");
+        b.cooldown_secs = 999;
+        let compiled = compile(&[a, b, rule("other", "^ok$")]);
+        assert_eq!(compiled.len(), 2);
+        assert_eq!(compiled[0].name, "dup");
+        assert_eq!(compiled[0].cooldown, std::time::Duration::from_secs(60));
+        assert_eq!(compiled[1].name, "other");
     }
 
     #[test]

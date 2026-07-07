@@ -121,8 +121,8 @@ async fn tick(
             kind = %m.kind,
             "pane rule matched"
         );
-        if m.command.is_some() {
-            run_command(m);
+        if let Some(command) = m.command.clone() {
+            run_command(m, command);
         }
     }
 }
@@ -172,8 +172,7 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
 /// Run a matched rule's command via `sh -c` with the match context in the
 /// environment. Detached from the tick loop so a slow command cannot stall
 /// scanning; killed after [`COMMAND_TIMEOUT`].
-fn run_command(m: PaneMatch) {
-    let command = m.command.clone().expect("checked by caller");
+fn run_command(m: PaneMatch, command: String) {
     crate::task_util::spawn_supervised(
         "server.pane_watchdog.command",
         crate::task_util::PanicPolicy::Log,
