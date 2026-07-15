@@ -555,8 +555,189 @@ fn claude_pane_shows_ready_prompt(
         && !claude_typed_prompt_without_parked_evidence(recent)
 }
 
-/// When Claude's status hook reports Running, the pane is consulted to catch two
-/// cases the hook stream can't express on its own:
+/// Claude Code shows a blocking "resume" picker when an interactive
+/// `--resume <id>` lands on a COMPACTED session: a one-line preamble ("We
+/// recommend resuming from a summary.") over a numbered menu whose options are
+/// "1. Resume from summary (recommended)" and "2. Resume full session as-is".
+/// Like the approval prompt it is a blocking input-wait, but it carries no
+/// "do you want to" question, no spinner, and no "esc to interrupt", so the
+/// spinner/interrupt detectors would call it Idle while the stale `running`
+/// hook status (the session was Running when its pane got recycled by the
+/// daemon's startup recovery) keeps the daemon reporting Running. Match the
+/// structural signature: a numbered-choice line whose text is one of the resume
+/// options. Requiring the numbered-choice shape, not a bare substring, keeps a
+/// pane that merely quotes the picker in prose (a chat message describing it,
+/// a commit diff) from being mistaken for the live menu.
+fn claude_has_resume_picker(recent: &[&str]) -> bool {
+    recent.iter().any(|line| {
+        if !claude_line_is_numbered_choice(line) {
+            return false;
+        }
+        let line_lower = line.to_lowercase();
+        line_lower.contains("resume from summary") || line_lower.contains("resume full session")
+    })
+}
+
+/// Strip ANSI and scan the recent pane lines for the resume picker. Shares the
+/// recent-window shape with `detect_claude_status`; mirrors
+/// `claude_pane_has_approval_prompt` for callers holding raw `capture-pane -e`.
+/// `pub(crate)` so the restart wake worker can detect the resume-from-summary
+/// picker a cross-account relocation lands on and dismiss it before a wake
+/// message would otherwise type harmlessly into the menu (see
+/// `session::restart::classify_wake_pane`).
+pub(crate) fn claude_pane_has_resume_picker(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
+    claude_has_resume_picker(&recent)
+}
+
+/// How many trailing non-empty pane lines the composer detectors scan. The
+/// composer prompt renders at the bottom of the pane with at most the box
+/// rule, the permissions footer, and a hint line below it.
+const CLAUDE_COMPOSER_TAIL: usize = 10;
+
+/// The Claude Code composer (input box) is rendered and accepting input: a
+/// `❯` prompt line in the trailing region that is NOT a numbered menu choice
+/// (the folder-trust dialog, resume picker, and approval menus all render
+/// their selection cursor as `❯ 1. ...`). This is the "truly ready" signal a
+/// post-restart send must gate on. Measured on a live boot: the pane's shell
+/// is replaced ~600ms before the composer renders, and a paste landing in
+/// that gap keeps its text but loses its submitting Enter (the boot-time
+/// terminal-mode churn consumes it), leaving the message sitting unsubmitted.
+/// `pub(crate)` for the daemon send path and the restart wake worker.
+pub(crate) fn claude_pane_input_ready(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    clean
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<&str>>()
+        .iter()
+        .rev()
+        .take(CLAUDE_COMPOSER_TAIL)
+        .any(|line| {
+            let trimmed = line.trim();
+            (trimmed == "❯" || trimmed.starts_with("❯ "))
+                && !claude_line_is_numbered_choice(trimmed)
+        })
+}
+
+/// `message` is sitting unsubmitted in the Claude composer: the paste landed
+/// but the submitting Enter was swallowed (the post-restart boot race). The
+/// composer renders the draft on its `❯` prompt line, so match a bounded
+/// prefix of the message's first line right after the cursor. Bounding the
+/// prefix keeps line wrapping and narrow panes from breaking the match;
+/// requiring the message's own text keeps an unrelated draft (someone else's
+/// half-typed input) from triggering a recovery Enter that would submit text
+/// this send does not own. `pub(crate)` for the same two callers.
+pub(crate) fn claude_message_stuck_in_composer(raw_content: &str, message: &str) -> bool {
+    let first_line = message.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return false;
+    }
+    let prefix: String = first_line.chars().take(32).collect();
+    let clean = strip_ansi(raw_content);
+    clean
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<&str>>()
+        .iter()
+        .rev()
+        .take(CLAUDE_COMPOSER_TAIL)
+        .any(|line| {
+            line.trim()
+                .strip_prefix('❯')
+                .map(str::trim_start)
+                .is_some_and(|draft| draft.starts_with(&prefix))
+        })
+}
+
+/// Claude Code prints a usage-limit banner when a subscription account hits its
+/// 5-hour or weekly cap mid-turn: the live turn is severed and a "usage limit
+/// reached … resets <time>" line replaces the spinner. No Stop/idle hook fires
+/// when the turn is cut by the limit, so the agent-self-reported status stays
+/// stuck at its last `running` write, and the pane shows no spinner / no "esc to
+/// interrupt" — so without this the daemon masks a capped session as actively
+/// working and the operator assumes work is progressing when nothing is.
+///
+/// Match is *line-anchored*, not a bare substring: a real banner is its OWN line
+/// that begins with the limit phrase ("Claude usage limit reached.", "5-hour
+/// limit reached ∙ resets 3pm"), whereas a pane that merely discusses limits in
+/// prose embeds the phrase mid-sentence ("...forit-main acct usage limit
+/// reached, weekly cap..."). Anchoring on the line start keeps that scrollback
+/// prose from flipping an actively-running session to Waiting. Leading
+/// non-alphanumerics (indent, the `∙`/`>` glyphs) are trimmed before the match.
+fn claude_line_is_limit_banner(line: &str) -> bool {
+    let l = line
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    l.starts_with("claude usage limit reached")
+        || l.starts_with("usage limit reached")
+        || l.starts_with("you've hit your usage limit")
+        || l.starts_with("you've hit your weekly limit")
+        || l.starts_with("you have hit your usage limit")
+        || l.starts_with("you have hit your weekly limit")
+        || l.starts_with("5-hour limit reached")
+        || l.starts_with("weekly limit reached")
+        || l.starts_with("approaching your usage limit")
+        || l.starts_with("upgrade to increase your usage limit")
+}
+
+/// A device-code / login prompt parks the session waiting on an out-of-band
+/// browser auth (Azure AD device-code, GitHub device flow, `gcloud`/`claude`
+/// OAuth) that the daemon can't see and no hook reports, so the session reads
+/// Running/Idle while it is really stuck needing the operator to authenticate.
+/// Ben flagged device-code waits as "incredibly unreliable" to notice. Treat it
+/// as a blocking wait. The URL / one-time-code shapes are distinctive enough
+/// that a prose mention is unlikely; the generic "enter the code" form is
+/// anchored with "to authenticate" to avoid false positives.
+fn claude_has_device_code_prompt(tail_lower: &str) -> bool {
+    tail_lower.contains("microsoft.com/devicelogin")
+        || tail_lower.contains("github.com/login/device")
+        || tail_lower.contains("/login/device")
+        || tail_lower.contains("first copy your one-time code")
+        || tail_lower.contains("to sign in, use a web browser")
+        || (tail_lower.contains("enter the code") && tail_lower.contains("to authenticate"))
+}
+
+/// True when the pane shows a blocking usage-limit banner or a device-code/login
+/// wait — both are states the operator must act on but which the spinner/hook
+/// pipeline would otherwise mask as Running (the "assume it's working" trap Ben
+/// hit). The limit banner is matched line-anchored (see
+/// `claude_line_is_limit_banner`), so it is safe to scan the full recent window.
+/// The device-code shapes are distinctive URLs/codes but are matched as
+/// substrings, so they are restricted to the last few non-empty lines (the
+/// prompt renders at the bottom when live) to keep an older scrollback mention
+/// from firing. Shared by `detect_claude_status` (pane-fallback path) and
+/// `reconcile_claude_hook_status` (hook-Running downgrade).
+fn claude_has_blocking_status_banner(recent: &[&str]) -> bool {
+    if recent.iter().any(|line| claude_line_is_limit_banner(line)) {
+        return true;
+    }
+    let tail_lower = recent
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .copied()
+        .collect::<Vec<&str>>()
+        .join("\n")
+        .to_lowercase();
+    claude_has_device_code_prompt(&tail_lower)
+}
+
+/// Strip ANSI and scan the recent pane lines for a blocking status banner.
+/// Mirrors `claude_pane_has_resume_picker` for callers holding raw
+/// `capture-pane -e` output.
+fn claude_pane_has_blocking_status_banner(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
+    claude_has_blocking_status_banner(&recent)
+}
+
+/// When Claude's status hook reports Running, the pane is consulted to catch
+/// the blocking states the hook stream can't express on its own:
 ///
 /// 1. A blocking prompt the user must answer: a tool-permission approval prompt
 ///    or an `AskUserQuestion` selection UI. Claude keeps its live spinner
@@ -2451,6 +2632,265 @@ enter to select · esc to cancel";
         let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
         assert_eq!(
             reconcile_claude_hook_status(Status::Running, pane, None),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_resume_picker() {
+        // The interactive resume-from-summary picker is a blocking input-wait.
+        // It has no "do you want to" question, no spinner, no "esc to
+        // interrupt", so the pre-fix detector returned Idle; it must now read
+        // Waiting. ANSI preserved to exercise the strip path live capture hits.
+        let pane = "\x1b[2m  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.\x1b[0m\n\
+\x1b[36m  ❯ 1. Resume from summary (recommended)\x1b[0m\n    2. Resume full session as-is";
+        assert_eq!(detect_claude_status(pane), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_resume_picker() {
+        // The daemon's startup recovery respawned a compacted session with
+        // `--resume`; the pane froze at the picker before Claude relaunched, so
+        // the last hook write is the stale `running` from before the recycle.
+        // The reconciler must downgrade Running -> Waiting so the health view
+        // stops masking the frozen session as actively working.
+        let pane = "  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.\n\
+  ❯ 1. Resume from summary (recommended)\n    2. Resume full session as-is";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_resume_picker_not_confused_by_prose_quote() {
+        // A pane that merely *quotes* the picker text in prose (a fleet chat
+        // message describing the stall, a commit diff) has no numbered-choice
+        // line, so it must NOT be mistaken for the live menu. The spinner still
+        // wins; a bare hook Running is left untouched.
+        let prose = "\
+  Routed to per-dev: classify resume-picker stalls as a distinct status
+  instead of \"Running\" (the daemon reports \"Resume from summary\" panes as
+  Running). 2 of 4 sampled sessions were stalled at resume-pickers.
+✶ Working… (4s · ↓ 88 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(prose), Status::Running);
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, prose),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_on_fresh_composer() {
+        // A freshly booted pane whose composer has rendered: the lone `❯`
+        // prompt line between the box rules, bypass footer below. This is the
+        // "truly ready" state a post-restart send must wait for (the shell
+        // being gone is ~600ms too early; a paste landing in that gap loses
+        // its submitting Enter). Captured from a live boot probe.
+        let pane = "\
+ ▐▛███▜▌   Claude Code v2.1.197
+▝▜█████▛▘  Sonnet 4.5 · Claude Max
+  ▘▘ ▝▝    /Users/benjaminwesleythomas/GitProjects/per-dev
+
+────────────────────────────────────────────────────────
+ ❯
+────────────────────────────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_false_on_booting_banner() {
+        // Mid-boot: the version banner is up but the composer has not rendered
+        // yet. A send now is exactly the race being fixed; not ready.
+        let pane = "\
+ ▐▛███▜▌   Claude Code v2.1.197
+▝▜█████▛▘  Sonnet 4.5 · Claude Max
+  ▘▘ ▝▝    /Users/benjaminwesleythomas/GitProjects/per-dev";
+        assert!(!claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_false_on_empty_pane() {
+        assert!(!claude_pane_input_ready(""));
+        assert!(!claude_pane_input_ready("\n\n\n"));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_false_on_trust_dialog() {
+        // The folder-trust dialog renders a `❯` cursor, but on a numbered
+        // menu choice: pasting a message here types into a menu, not the
+        // composer. Not ready.
+        let pane = "\
+ Do you trust the files in this folder?
+
+ /Users/benjaminwesleythomas/GitProjects/per-dev
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit";
+        assert!(!claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_false_on_resume_picker() {
+        let pane = "\
+  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is";
+        assert!(!claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_with_ansi_and_running_turn() {
+        // Mid-turn the composer stays rendered below the spinner (steering
+        // input is legitimate), and live capture carries ANSI. Ready.
+        let pane = "\x1b[2m✶ Working… (4s · ↓ 88 tokens)\x1b[0m\n\
+────────────────────────────────\n\
+\x1b[1m ❯ \x1b[0m\n\
+────────────────────────────────\n\
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_in_composer_on_swallowed_enter() {
+        // The boot race outcome observed live: the daemon's paste landed in
+        // the composer but the trailing Enter was consumed by boot-time
+        // terminal-mode churn, so the message sits unsubmitted after `❯`.
+        let pane = "\
+────────────────────────────────────────────────────────
+ ❯ RACE-PROBE-MESSAGE this text was pasted during boot
+────────────────────────────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_message_stuck_in_composer(
+            pane,
+            "RACE-PROBE-MESSAGE this text was pasted during boot"
+        ));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_matches_on_bounded_prefix() {
+        // A long message wraps/truncates on the composer line; only a bounded
+        // prefix of its first line is required to match.
+        let message = "STATUS UPDATE: please re-verify the gateway health probe and report the exact timestamp delta plus the disposition flip you observed";
+        let pane = " ❯ STATUS UPDATE: please re-verify the gateway health probe and report the exa\n   ⏵⏵ bypass permissions on";
+        assert!(claude_message_stuck_in_composer(pane, message));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_uses_first_line_of_multiline_message() {
+        let message = "line one of the work order\nline two detail";
+        let pane = " ❯ line one of the work order\n   ⏵⏵ bypass permissions on";
+        assert!(claude_message_stuck_in_composer(pane, message));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_false_on_empty_composer() {
+        // The message submitted; the composer is back to a bare prompt.
+        let pane = "\
+────────────────────────────────\n ❯ \n────────────────────────────────";
+        assert!(!claude_message_stuck_in_composer(
+            pane,
+            "RACE-PROBE-MESSAGE this text was pasted during boot"
+        ));
+        assert!(!claude_message_stuck_in_composer(pane, ""));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_false_on_unrelated_composer_text() {
+        // Someone else's draft sits in the composer; pressing Enter for it
+        // would submit text this send does not own. Must not match.
+        let pane = " ❯ an unrelated half-typed draft\n   ⏵⏵ bypass permissions on";
+        assert!(!claude_message_stuck_in_composer(
+            pane,
+            "RACE-PROBE-MESSAGE this text was pasted during boot"
+        ));
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_weekly_limit_banner() {
+        // Ben's bug: a subscription account caps mid-turn, the live turn is
+        // severed, and the daemon kept reporting the session as Running ("in
+        // progress") so the operator assumed work was progressing. The cap
+        // banner must outrank any residual spinner/interrupt text and read as
+        // Waiting (tier 0).
+        let content = "\
+  Generating the report…
+
+  Claude usage limit reached. You've hit your weekly limit.
+  Your limit will reset on Jul 1 at 8am.
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_5_hour_limit_compact_banner() {
+        // The compact "5-hour limit reached ∙ resets <time>" form, whatever the
+        // separator glyph: matched by the (limit reached AND reset) shape.
+        let content = "\
+✶ Working… (12s · ↓ 2.1k tokens)
+  5-hour limit reached ∙ resets 3pm (America/Los_Angeles)";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_device_code_microsoft() {
+        // A device-code login parks the session on an out-of-band browser auth
+        // the daemon can't see — Ben flagged these as "incredibly unreliable"
+        // to notice. Surface as Waiting.
+        let content = "\
+  To sign in, use a web browser to open the page https://microsoft.com/devicelogin
+  and enter the code F7X9K2Q2 to authenticate.";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_device_code_github() {
+        let content = "\
+  ! First copy your one-time code: A1B2-C3D4
+  Press Enter to open github.com/login/device in your browser...";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_limit_banner() {
+        // The hook is stuck at `running` (the limit cut the turn before any
+        // Stop/idle hook fired). The reconciler must downgrade to Waiting so
+        // the health view stops masking the capped session as working. ANSI
+        // preserved to exercise the strip path live capture goes through.
+        let pane = "\x1b[2m  Claude usage limit reached. Your limit will reset at 3pm.\x1b[0m";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_device_code() {
+        let pane = "  To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code F7X9K2Q2 to authenticate.";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_limit_banner_not_confused_by_scrollback_prose() {
+        // A pane that merely *discusses* usage limits in older scrollback (a
+        // fleet capacity message) but is actively running must stay Running:
+        // the banner scan only looks at the last few non-empty lines, so the
+        // live spinner + interrupt hint at the bottom still win.
+        let content = "\
+  Commander WO: forit-main acct usage limit reached, weekly cap till Jul 1.
+  Repointing the default draw to gna-main for now.
+  Reading config.toml…
+  Patched default_profile.
+✶ Working… (4s · ↓ 88 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Running);
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, content),
             Status::Running
         );
     }
