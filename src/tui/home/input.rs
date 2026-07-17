@@ -99,16 +99,10 @@ fn persist_telemetry_consent(opt_in: bool) {
     crate::telemetry::apply_opt_in_change(opt_in);
 }
 
-/// xterm bracketed-paste start sequence: `ESC [ 2 0 0 ~`. An agent that
-/// has enabled bracketed paste mode (`\e[?2004h`) treats everything
-/// between this marker and the matching end marker as one paste rather
-/// than as keystrokes, so interior newlines accumulate in the input
-/// buffer instead of firing `submit` per line.
-const BRACKETED_PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
-
-/// xterm bracketed-paste end sequence: `ESC [ 2 0 1 ~`. Pairs with
-/// [`BRACKETED_PASTE_START`].
-const BRACKETED_PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
+// Bracketed-paste markers live in `live_send` (shared with its
+// machine-speed burst framing); interior newlines accumulate in the
+// agent's input buffer instead of firing `submit` per line.
+use super::live_send::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
 
 /// Decompose pasted text into a series of `TmuxKey`s safe for the
 /// live-send worker to dispatch.
