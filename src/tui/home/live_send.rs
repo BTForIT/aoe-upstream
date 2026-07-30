@@ -3196,7 +3196,7 @@ mod tests {
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None, false);
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -3257,7 +3257,7 @@ mod tests {
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None, false);
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -3287,7 +3287,7 @@ mod tests {
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_late");
         // Spawn against a name that does not exist yet: the entry steal sees
         // no session and leaves the worker unowned.
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None, false);
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let out = crate::tmux::tmux_command()
@@ -3341,7 +3341,7 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_vacant");
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None, false);
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let out = crate::tmux::tmux_command()

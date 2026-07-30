@@ -1082,6 +1082,7 @@ impl Session {
     /// Blocking (bounded ~22s worst case: ready wait + draft wait + verify);
     /// call from a blocking context.
     pub fn send_keys_verified(&self, text: &str, enter_delay_ms: u64, tool: &str) -> Result<()> {
+        reject_forged_boundary(text)?;
         if tool != "claude" {
             return self.send_keys_with_delay(text, enter_delay_ms);
         }
@@ -1107,14 +1108,15 @@ impl Session {
         let mut ready_deadline = std::time::Instant::now() + READY_TIMEOUT;
         let mut trust_answered = false;
         // A composer holding an operator's half-typed draft counts as "ready"
-        // above, but pasting into it fuses the draft with this message and
-        // submits the merged blob under the operator's name. Wait, bounded
-        // separately from the ready window, for the draft to clear; if it
-        // does not, remember it so the payload carries an explicit boundary
-        // marker and the verify phase keys on the draft (which stays on the
-        // `❯` line) instead of this message.
+        // above, but pasting into it fuses the draft with this message, and the
+        // trailing Enter then submits the merged blob under the operator's
+        // name -- their unsent words delivered as though they had said them.
+        // Wait, bounded separately from the ready window, for the draft to
+        // clear; if it does not, REFUSE. The two failure directions are not
+        // symmetric: an undelivered message is reported and can be resent,
+        // whereas a human's draft submitted under their name cannot be
+        // recalled and forges authorship they never gave.
         let mut draft_deadline: Option<std::time::Instant> = None;
-        let mut interrupted_draft: Option<String> = None;
         loop {
             let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
             if super::status_detection::claude_pane_input_ready(&content) {
@@ -1127,7 +1129,7 @@ impl Session {
                     let refusal = ParkedDraftRefusal::from_draft(&draft);
                     tracing::warn!(target: "tmux.command",
                         "send_keys_verified: operator draft still in composer after \
-                         {DRAFT_TIMEOUT:?}; injecting below it with a boundary marker"
+                         {DRAFT_TIMEOUT:?}; {refusal}"
                     );
                     // Typed, not `bail!`: the API layer has to tell this
                     // refusal apart from a transport failure, and only a
@@ -1162,7 +1164,7 @@ impl Session {
                 // ready detector says no (a redraw flicker, or a composer
                 // shape the detector doesn't recognize — the WO#453 fusion
                 // rode exactly this branch). If the final capture shows one,
-                // still send with the boundary marker rather than fuse.
+                // refuse here too rather than fuse.
                 if let Some(draft) = super::status_detection::claude_composer_draft(&content) {
                     let refusal = ParkedDraftRefusal::from_draft(&draft);
                     tracing::warn!(target: "tmux.command",
@@ -1175,16 +1177,10 @@ impl Session {
             std::thread::sleep(READY_POLL);
         }
 
-        let payload = if interrupted_draft.is_some() {
-            compose_injection_with_draft_marker(text)
-        } else {
-            text.to_string()
-        };
-        // When injecting below a parked draft, the `❯` line keeps showing the
-        // DRAFT (this message lands on continuation lines), so the stuck-check
-        // must key on the draft text or it would false-negative every time.
-        let verify_key: &str = interrupted_draft.as_deref().unwrap_or(text);
-        self.send_keys_with_delay(&payload, enter_delay_ms)?;
+        // Every path reaching here left the composer empty, so the `❯` line
+        // will show this message and nothing else -- the stuck-check keys on
+        // the message itself, with no draft to disambiguate against.
+        self.send_keys_with_delay(text, enter_delay_ms)?;
 
         // Phase 2: confirm the message left the composer. A matching draft
         // still parked at `❯` while the pane is not generating means the
@@ -1192,7 +1188,7 @@ impl Session {
         for _attempt in 0..MAX_SUBMIT_RETRIES {
             std::thread::sleep(VERIFY_SETTLE);
             let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
-            if !super::status_detection::claude_message_stuck_in_composer(&content, verify_key) {
+            if !super::status_detection::claude_message_stuck_in_composer(&content, text) {
                 return Ok(());
             }
             if super::status_detection::detect_status_from_content(&content, tool)
@@ -1209,7 +1205,7 @@ impl Session {
             self.send_raw_bytes(b"\r")?;
         }
         let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
-        if super::status_detection::claude_message_stuck_in_composer(&content, verify_key) {
+        if super::status_detection::claude_message_stuck_in_composer(&content, text) {
             tracing::warn!(target: "tmux.command",
                 "send_keys_verified: message still unsubmitted after {MAX_SUBMIT_RETRIES} Enter resends"
             );
