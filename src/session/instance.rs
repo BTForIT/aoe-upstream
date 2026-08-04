@@ -3486,7 +3486,14 @@ impl Instance {
                 Some(a) => {
                     let mut cmd = a.launch_base_command();
                     if !self.extra_args.is_empty() {
-                        cmd = format!("{} {}", cmd, self.extra_args);
+                        // A model id carrying shell metacharacters (a
+                        // context-window suffix such as `[1m]`) would abort the
+                        // launch line before the agent starts.
+                        cmd = format!(
+                            "{} {}",
+                            cmd,
+                            super::config::quote_model_value_in_args(&self.extra_args)
+                        );
                     }
                     if self.is_yolo_mode() {
                         if let Some(ref yolo) = a.yolo {

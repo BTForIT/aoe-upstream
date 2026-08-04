@@ -2650,6 +2650,113 @@ pub fn get_telemetry_settings() -> TelemetryConfig {
     Config::load_or_warn().telemetry
 }
 
+/// Wrap a value so the launching shell passes it through literally.
+///
+/// Only quotes when the value contains something a shell would interpret, so
+/// ordinary model ids keep their current, unquoted command line.
+fn shell_quote_value(value: &str) -> String {
+    const SAFE: &str = "-_./:=@,+";
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || SAFE.contains(c));
+    if plain {
+        return value.to_string();
+    }
+    // Already quoted by whoever wrote it: re-quoting would nest, and the agent
+    // would receive a model id with literal quote characters in it.
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Quote a shell-active `--model` / `-m` VALUE inside a free-form extra-args
+/// string, leaving every other token exactly as the user wrote it.
+///
+/// `extra_args` is spliced into the launch command verbatim, so a model id
+/// carrying shell metacharacters aborts the whole line before the agent
+/// starts. A context-window suffix does exactly that: `--model claude-x[1m]`
+/// dies under zsh with `no matches found: claude-x[1m]`, status 1, and the
+/// pane is dead at launch with nothing to show for it.
+///
+/// Quoting only the model value keeps the rest of `extra_args` usable as the
+/// caller's own argv, where shell syntax may well be intended.
+pub fn quote_model_value_in_args(args: &str) -> String {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        let tok = toks[i];
+        if let Some((lhs, value)) = tok.split_once('=') {
+            if (lhs == "--model" || lhs == "-m") && !value.is_empty() {
+                out.push(format!("{lhs}={}", shell_quote_value(value)));
+                i += 1;
+                continue;
+            }
+        }
+        if (tok == "--model" || tok == "-m") && i + 1 < toks.len() {
+            out.push(tok.to_string());
+            out.push(shell_quote_value(toks[i + 1]));
+            i += 2;
+            continue;
+        }
+        out.push(tok.to_string());
+        i += 1;
+    }
+    out.join(" ")
+}
+
+#[cfg(test)]
+mod model_value_quoting_tests {
+    use super::*;
+
+    #[test]
+    fn a_context_window_suffix_is_quoted() {
+        assert_eq!(
+            quote_model_value_in_args("--model claude-x[1m]"),
+            "--model 'claude-x[1m]'"
+        );
+        assert_eq!(
+            quote_model_value_in_args("--model=claude-x[1m]"),
+            "--model='claude-x[1m]'"
+        );
+        assert_eq!(
+            quote_model_value_in_args("-m claude-x[1m]"),
+            "-m 'claude-x[1m]'"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_model_id_is_left_alone() {
+        // Quoting everything would change every existing command line.
+        for args in ["--model claude-opus-4-8", "-m gpt-5", "--model=sonnet"] {
+            assert_eq!(quote_model_value_in_args(args), args);
+        }
+    }
+
+    #[test]
+    fn other_arguments_are_never_rewritten() {
+        let args = "--verbose --model claude-x[1m] --flag value";
+        let got = quote_model_value_in_args(args);
+        assert!(got.contains("--verbose"));
+        assert!(got.contains("--flag value"));
+        assert!(got.contains("'claude-x[1m]'"));
+    }
+
+    #[test]
+    fn an_already_quoted_value_is_not_nested() {
+        let args = "--model 'claude-x[1m]'";
+        assert_eq!(quote_model_value_in_args(args), args);
+    }
+
+    #[test]
+    fn a_dangling_flag_is_harmless() {
+        assert_eq!(quote_model_value_in_args("--model"), "--model");
+        assert_eq!(quote_model_value_in_args(""), "");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
