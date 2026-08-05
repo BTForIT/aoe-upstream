@@ -2664,8 +2664,13 @@ fn shell_quote_value(value: &str) -> String {
         return value.to_string();
     }
     // Already quoted by whoever wrote it: re-quoting would nest, and the agent
-    // would receive a model id with literal quote characters in it.
-    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+    // would receive a model id with literal quote characters in it. Both
+    // quote styles are shell-valid ways to protect a value, so either wrapper
+    // is left alone.
+    let already_quoted = value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')));
+    if already_quoted {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', r"'\''"))
@@ -2681,30 +2686,44 @@ fn shell_quote_value(value: &str) -> String {
 /// pane is dead at launch with nothing to show for it.
 ///
 /// Quoting only the model value keeps the rest of `extra_args` usable as the
-/// caller's own argv, where shell syntax may well be intended.
+/// caller's own argv, where shell syntax may well be intended. Untouched
+/// regions (including their original whitespace) are copied byte-for-byte
+/// rather than round-tripped through a tokenize/rejoin, which would collapse
+/// runs of whitespace elsewhere in the string.
 pub fn quote_model_value_in_args(args: &str) -> String {
-    let toks: Vec<&str> = args.split_whitespace().collect();
-    let mut out: Vec<String> = Vec::with_capacity(toks.len());
-    let mut i = 0;
-    while i < toks.len() {
-        let tok = toks[i];
-        if let Some((lhs, value)) = tok.split_once('=') {
+    let mut out = String::with_capacity(args.len());
+    let mut rest = args;
+    let mut expect_model_value = false;
+    loop {
+        let ws_len = rest.len() - rest.trim_start().len();
+        out.push_str(&rest[..ws_len]);
+        rest = &rest[ws_len..];
+        if rest.is_empty() {
+            break;
+        }
+        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..tok_len];
+        let assigned_model_value = tok.split_once('=').and_then(|(lhs, value)| {
             if (lhs == "--model" || lhs == "-m") && !value.is_empty() {
-                out.push(format!("{lhs}={}", shell_quote_value(value)));
-                i += 1;
-                continue;
+                Some((lhs, value))
+            } else {
+                None
             }
+        });
+        if expect_model_value {
+            out.push_str(&shell_quote_value(tok));
+            expect_model_value = false;
+        } else if let Some((lhs, value)) = assigned_model_value {
+            out.push_str(lhs);
+            out.push('=');
+            out.push_str(&shell_quote_value(value));
+        } else {
+            out.push_str(tok);
+            expect_model_value = tok == "--model" || tok == "-m";
         }
-        if (tok == "--model" || tok == "-m") && i + 1 < toks.len() {
-            out.push(tok.to_string());
-            out.push(shell_quote_value(toks[i + 1]));
-            i += 2;
-            continue;
-        }
-        out.push(tok.to_string());
-        i += 1;
+        rest = &rest[tok_len..];
     }
-    out.join(" ")
+    out
 }
 
 #[cfg(test)]
@@ -2739,9 +2758,22 @@ mod model_value_quoting_tests {
     fn other_arguments_are_never_rewritten() {
         let args = "--verbose --model claude-x[1m] --flag value";
         let got = quote_model_value_in_args(args);
-        assert!(got.contains("--verbose"));
-        assert!(got.contains("--flag value"));
-        assert!(got.contains("'claude-x[1m]'"));
+        assert_eq!(got, "--verbose --model 'claude-x[1m]' --flag value");
+    }
+
+    #[test]
+    fn unrelated_whitespace_and_quoting_survive_byte_for_byte() {
+        // A tokenize/join round trip would collapse the double space here and
+        // re-wrap an already double-quoted model value, changing what the
+        // agent receives even though neither token needed rewriting.
+        let cases = [
+            ("--prompt \"hello  world\"", "--prompt \"hello  world\""),
+            ("--model \"gpt-5\"", "--model \"gpt-5\""),
+            ("--flag1   --flag2", "--flag1   --flag2"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(quote_model_value_in_args(input), expected, "{input:?}");
+        }
     }
 
     #[test]
