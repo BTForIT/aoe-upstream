@@ -567,13 +567,6 @@ impl Instance {
     pub fn update_status(&mut self) {
         self.update_status_with_metadata(None, None);
     }
-
-    /// Capture the session's window for the preview, with any panes the user
-    /// split off composited in. `capture-pane` has no size parameters: the
-    /// window is captured at its own dimensions.
-    pub fn capture_output_composited(&self, lines: usize) -> Result<String> {
-        self.tmux_session()?.capture_window_composited(lines)
-    }
 }
 
 #[cfg(test)]
@@ -1255,6 +1248,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 "-y",
                 "40",
                 &launch,
+                ";",
+                "set-option",
+                "-t",
+                &session_name,
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("spawn tmux");
