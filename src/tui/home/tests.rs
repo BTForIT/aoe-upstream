@@ -8233,6 +8233,7 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -8285,6 +8286,104 @@ fn apply_status_update_propagates_live_status_baseline_from_poller() {
     );
 }
 
+// #3642: the poller decides on a *clone* too (see `status_poller.rs`), so
+// the detection bookkeeping `update_status_from_manifest` writes reaches the
+// next cycle only through `StatusUpdate`. Dropped, every cycle started with
+// no proposal on record, so a `Running -> Idle` that no rule read off the
+// agent's own chrome proposed itself forever and the row never left Running.
+//
+// Two real cycles over a live pane parked on a screen no Claude rule matches:
+// the first proposes, the second publishes.
+#[test]
+#[serial]
+fn poll_cycles_confirm_an_unwitnessed_idle_through_the_status_update() {
+    use crate::session::Status;
+    use crate::tui::status_poller::{poll_statuses_once, StatusPollState};
+
+    if crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    let session_name = {
+        let inst = env.view.get_instance(&id).unwrap();
+        assert_eq!(
+            inst.tool, "claude",
+            "fixture invariant: this test needs an agent with a manifest"
+        );
+        crate::tmux::Session::generate_name(&inst.id, &inst.title)
+    };
+    let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
+    let created = crate::tmux::tmux_command()
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            // `exec` so tmux reports the pane's command as `sleep` rather
+            // than the launching shell, which the stale-shell check would
+            // read as an agent that exited.
+            "printf 'turn over\n'; exec sleep 300",
+        ])
+        .output()
+        .expect("spawn tmux");
+    assert!(
+        created.status.success(),
+        "tmux new-session failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    // Mid-turn, as the poller last left it.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+        inst.live_status_baseline = Some(Status::Running);
+    });
+
+    // The launch is asynchronous: poll until the frame is drawn and the
+    // shell has `exec`ed, so the first cycle reads the parked pane rather
+    // than a pane still being set up.
+    let ready = (0..100).any(|_| {
+        if crate::tmux::utils::pane_current_command(&session_name).as_deref() == Some("sleep") {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        false
+    });
+    assert!(ready, "pane never settled on its parked command");
+
+    let mut poll_state = StatusPollState::new();
+    let mut published = Vec::new();
+    for _ in 0..2 {
+        let updates = poll_statuses_once(env.view.pollable_instances(), &mut poll_state);
+        for update in updates {
+            env.view.apply_one_status_update(update);
+        }
+        published.push(env.view.get_instance(&id).unwrap().status);
+    }
+
+    assert_eq!(
+        published,
+        vec![Status::Running, Status::Idle],
+        "an unwitnessed Idle waits one cycle, then publishes on the cycle \
+         that agrees with it (#3642)"
+    );
+}
+
 // #2690: `IdleIntent::Keep` means the producer has no observation for
 // `idle_entered_at`. The consumer must not touch the field, or an
 // unseeded `attached_status_hooks` snapshot on attach exit would clobber
@@ -8319,6 +8418,7 @@ fn apply_status_update_preserves_idle_entered_at_on_keep() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     assert_eq!(
@@ -8355,6 +8455,7 @@ fn apply_status_update_persists_genuine_transition_to_disk() {
         last_accessed_at: Some(now),
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -8389,6 +8490,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
     assert_eq!(
         env.view.get_instance(&id).unwrap().idle_entered_at,
@@ -8407,6 +8509,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -8505,6 +8608,7 @@ fn apply_status_update_skips_terminal_states() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     // Status and timestamp should both stay untouched.
@@ -8580,6 +8684,7 @@ fn apply_status_update_runs_status_hook_on_transition() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let launches = take_recorded_launches();
@@ -8644,6 +8749,7 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     assert!(take_recorded_launches().is_empty());
@@ -8677,6 +8783,7 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             last_accessed_at: None,
             pane_dead: false,
             live_status_baseline: None,
+            detection: None,
         }]);
 
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);
