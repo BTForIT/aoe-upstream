@@ -1344,14 +1344,11 @@ pub struct SessionConfig {
     )]
     pub live_send_leader: String,
 
-    /// How the TUI attaches to a terminal-mode session: what Enter (and
-    /// double-click) does on a session row in the Agent view, and what
-    /// happens immediately after a new session finishes creating. `Tmux`
-    /// (default) drops into the tmux attach view, the historical behavior.
-    /// `LiveSend` enters live-send mode instead, so the home list stays
-    /// visible and keystrokes pipe through to the agent; users who never
-    /// want to be inside tmux directly pick this. Terminal/Tool views and
-    /// acp sessions ignore this setting.
+    /// How the TUI activates an existing terminal-mode session when you press
+    /// Enter or double-click its row. `Tmux` (default) opens the tmux attach
+    /// view. `LiveSend` enters live-send mode, so the home list stays visible
+    /// and keystrokes go to the agent. Terminal/Tool views and acp sessions
+    /// ignore this setting.
     #[serde(default)]
     #[setting(
         label = "Attach Mode",
@@ -1360,6 +1357,16 @@ pub struct SessionConfig {
         category = "Interaction"
     )]
     pub default_attach_mode: AttachMode,
+
+    /// How the TUI opens a terminal-mode session after it is created.
+    #[serde(default)]
+    #[setting(
+        label = "New Session Mode",
+        widget = "select",
+        options = "match_default:Match default attach,tmux:Tmux,live_send:Live mode",
+        category = "Interaction"
+    )]
+    pub new_session_mode: NewSessionMode,
 
     /// Automatically start live-send when switching into Terminal or Tool
     /// view, instead of requiring a separate Enter/Tab/click.
@@ -1603,8 +1610,19 @@ pub enum ClickAction {
     SelectOnly,
 }
 
-/// How the TUI attaches to a terminal-mode session, both on activating an
-/// existing row and right after creating a new session. See
+/// How the TUI opens a terminal-mode session after creation. `MatchDefault`
+/// preserves the historical behavior by using
+/// `SessionConfig::default_attach_mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewSessionMode {
+    #[default]
+    MatchDefault,
+    Tmux,
+    LiveSend,
+}
+
+/// How the TUI activates an existing terminal-mode session. See
 /// `SessionConfig::default_attach_mode`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1678,6 +1696,7 @@ impl Default for SessionConfig {
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),
+            new_session_mode: NewSessionMode::default(),
             live_send_on_view_switch: false,
             click_action: ClickAction::default(),
             confirm_before_quit: true,
@@ -4382,6 +4401,36 @@ mod tests {
             "vt_live is machine-level (the server reads global config); a \
              profile override would desync the TUI and web transports"
         );
+    }
+
+    #[test]
+    fn test_new_session_mode_in_settings_schema() {
+        // The single-source schema must expose the select so the TUI and
+        // web settings both render it (docs/development/adding-settings.md).
+        // The option values are hand-written in the `#[setting(...)]`
+        // attribute, so each one is round-tripped through `NewSessionMode`:
+        // a typo would offer a choice that the config layer rejects on save.
+        let schema = crate::session::config::settings_schema::schema();
+        let field = schema
+            .iter()
+            .find(|f| f.section == "session" && f.field == "new_session_mode")
+            .expect("new_session_mode field in session schema section");
+        let settings_schema::WidgetKind::Select { options } = &field.widget else {
+            panic!("new_session_mode must render as a select");
+        };
+        let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["match_default", "tmux", "live_send"]);
+        for value in values {
+            let parsed: NewSessionMode = serde_json::from_str(&format!("\"{value}\""))
+                .unwrap_or_else(|e| {
+                    panic!("select option {value:?} must deserialize into NewSessionMode: {e}")
+                });
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                format!("\"{value}\""),
+                "select option {value:?} must round-trip"
+            );
+        }
     }
 
     // Tests for DiffConfig

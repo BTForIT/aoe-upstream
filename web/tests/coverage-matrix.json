@@ -2559,6 +2559,13 @@
       "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"]
     },
     {
+      "id": "story.settings-new-session-mode",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/NewSessionModePatch.test.tsx"],
+      "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"]
+    },
+    {
       "id": "story.settings-tmux-mouse",
       "kind": "vitest",
       "risk": "low",
