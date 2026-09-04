@@ -902,15 +902,29 @@ pub struct AppStateConfig {
 
 /// Session-related configuration defaults
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
-#[setting_section(name = "session", category = "Session")]
+// `repo_default = "deny"`: most of this section is personal preference, but
+// several fields name or build the command AoE hands to tmux
+// (`custom_agents`, `agent_command_override`, `agent_extra_args`,
+// `agent_acp_cmd`, `smart_rename_agent`, `smart_rename_model`) or weaken the
+// agent's own permission gate (`yolo_mode_default`). Honoring those from a
+// checked-out repo is arbitrary host command execution at session launch, the
+// hazard that already keeps `host_hooks` out of `REPO_OVERRIDABLE_SECTIONS`.
+// Denying by default means a field added here later stays repo-denied until
+// someone marks it `repo = "allow"` (#3154).
+#[setting_section(name = "session", category = "Session", repo_default = "deny")]
 pub struct SessionConfig {
     /// Default coding tool for new sessions. If not set or the tool is
-    /// unavailable, falls back to the first available tool.
+    /// unavailable, falls back to the first available tool. Repo-denied: the
+    /// launch path exact-matches the user's `custom_agents` before built-ins,
+    /// so a repo could name a user-defined host command, and validating
+    /// against built-in names would not help because custom agents may
+    /// shadow them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Default Tool",
         widget = "custom:default-tool",
-        category = "Agents"
+        category = "Agents",
+        repo = "deny"
     )]
     pub default_tool: Option<String>,
 
@@ -1122,7 +1136,8 @@ pub struct SessionConfig {
         label = "Agent Detect As",
         widget = "list",
         web = "local_only:part of the agent-command surface, edited locally only",
-        category = "Agents"
+        category = "Agents",
+        repo = "allow"
     )]
     pub agent_detect_as: HashMap<String, String>,
 
@@ -2272,7 +2287,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "Enabled by Default",
         widget = "toggle",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        repo = "deny"
     )]
     pub enabled_by_default: bool,
 
@@ -2281,7 +2297,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "Default Image",
         widget = "text",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        repo = "deny"
     )]
     pub default_image: String,
 
@@ -2292,6 +2309,7 @@ pub struct SandboxConfig {
         widget = "list",
         validate = "volume_list",
         web = "elevation:sandbox config affects host isolation",
+        repo = "deny",
         advanced
     )]
     pub extra_volumes: Vec<String>,
@@ -2362,8 +2380,8 @@ pub struct SandboxConfig {
     /// via the runtime's bridge), "none" for no network (isolates the agent but
     /// also cuts off its own model API unless a proxy is routed in), or a named
     /// network to attach a user-defined network with its own egress filtering.
-    /// "host" is rejected because sharing the host network namespace defeats
-    /// sandbox isolation.
+    /// "host" and namespace-sharing forms ("container:", "ns:") are rejected
+    /// because they defeat sandbox isolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Network",
@@ -2412,7 +2430,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "Mount SSH",
         widget = "toggle",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        repo = "deny"
     )]
     pub mount_ssh: bool,
 
@@ -2424,6 +2443,7 @@ pub struct SandboxConfig {
         label = "SELinux Relabel",
         widget = "toggle",
         web = "elevation:sandbox config affects host isolation",
+        repo = "deny",
         advanced
     )]
     pub selinux_relabel: bool,
@@ -2445,7 +2465,8 @@ pub struct SandboxConfig {
         label = "Container Runtime",
         widget = "select",
         options = "docker:Docker,podman:Podman,apple_container:Apple Container",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        global_only
     )]
     pub container_runtime: ContainerRuntimeName,
 }
