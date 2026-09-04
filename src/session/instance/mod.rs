@@ -648,6 +648,11 @@ pub struct Instance {
     pub last_error: Option<String>,
     #[serde(skip)]
     pub session_id_poller: Option<Arc<Mutex<SessionPoller>>>,
+    /// Retry schedule for replacing a missing session-id poller when the
+    /// process-wide thread budget (or a start failure) blocked the last
+    /// attempt. Runtime-only; carried across reloads like the poller.
+    #[serde(skip)]
+    pub(crate) poller_repair: crate::session::poller::PollerRepairBackoff,
 
     /// Runtime-only set of session IDs that retroactive capture must NOT
     /// re-discover from on-disk artifacts after an explicit resume-target

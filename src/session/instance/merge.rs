@@ -105,6 +105,7 @@ impl Instance {
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
         self.session_id_poller = previous.session_id_poller.clone();
+        self.poller_repair = previous.poller_repair.clone();
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
     }
 
