@@ -74,7 +74,6 @@ fn command_consumes_profile(command: &Option<Commands>) -> bool {
         ) => true,
         // The bare TUI (no subcommand) launches under `--profile` too.
         None => true,
-        #[cfg(feature = "serve")]
         Some(Commands::Serve(_)) => true,
         _ => false,
     }
