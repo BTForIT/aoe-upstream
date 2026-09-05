@@ -33,19 +33,49 @@ pub enum Event {
 
 pub type Reporter = Arc<dyn Fn(Event) + Send + Sync>;
 
-static REPORTER: RwLock<Option<Reporter>> = RwLock::new(None);
-
-/// Installs `reporter` until the returned guard drops.
-pub(super) fn install(reporter: Option<Reporter>) -> ReporterGuard {
-    *REPORTER.write().unwrap_or_else(|e| e.into_inner()) = reporter;
-    ReporterGuard
+/// A reporter for callers with no screen of their own: the store move on the
+/// container path runs while a user waits, so it must leave a trail even when
+/// nothing installed a renderer. `Progress` is dropped, being the per-100-file
+/// refinement, and everything else is logged once.
+pub fn tracing_reporter() -> Reporter {
+    Arc::new(|event| match event {
+        Event::Started { version, name, .. } => {
+            tracing::info!(target: "migrations", version, name, "running migration");
+        }
+        Event::Step(message) => tracing::info!(target: "migrations", "{message}"),
+        Event::Notice(message) => tracing::warn!(target: "migrations", "{message}"),
+        Event::Finished { version, elapsed } => {
+            tracing::info!(
+                target: "migrations",
+                version,
+                duration_ms = elapsed.as_millis() as u64,
+                "migration completed"
+            );
+        }
+        Event::Progress(_) => {}
+    })
 }
 
-pub(super) struct ReporterGuard;
+static REPORTER: RwLock<Option<Reporter>> = RwLock::new(None);
+
+/// Installs `reporter` until the returned guard drops, which puts back
+/// whatever was installed before. The store-move path installs its own
+/// reporter from a session launch, so an install can now nest inside or race
+/// one from `run_migrations`; restoring `None` would silence that caller for
+/// the rest of its run.
+pub(super) fn install(reporter: Option<Reporter>) -> ReporterGuard {
+    let previous = std::mem::replace(
+        &mut *REPORTER.write().unwrap_or_else(|e| e.into_inner()),
+        reporter,
+    );
+    ReporterGuard(previous)
+}
+
+pub(super) struct ReporterGuard(Option<Reporter>);
 
 impl Drop for ReporterGuard {
     fn drop(&mut self) {
-        *REPORTER.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *REPORTER.write().unwrap_or_else(|e| e.into_inner()) = self.0.take();
     }
 }
 

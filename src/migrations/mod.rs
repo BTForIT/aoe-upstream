@@ -202,14 +202,49 @@ pub fn has_pending_migrations() -> bool {
 }
 
 /// Run all pending migrations silently. Call this early in app startup.
+/// Move this session's sandbox store into the private layout, if it is still
+/// on the shared one. Called from the container path so the copy is paid by
+/// the session that needs it rather than by every pending row on any `aoe`
+/// start.
+///
+/// `reporter` is how a caller with a screen narrates the copy. Nothing passes
+/// one yet: [`migrate_sandbox_store_for`] installs `tracing_reporter`, which
+/// reaches the log and, under `ProcessContext::Tui`, only the log
+/// (`logging.rs` forces a file sink there). So a large store still copies with
+/// nothing drawn, which is #3757's boot hang relocated to attach rather than
+/// removed. This parameter exists so the TUI and CLI launch paths can close
+/// that; until one does, the gap is real and the log is the only trail.
+///
+/// A failure here is reported by the caller and does not block the launch:
+/// a row that did not move stays on its shared store and is retried.
+pub fn migrate_sandbox_store_for_with(
+    id: &str,
+    reporter: Option<progress::Reporter>,
+) -> Result<()> {
+    if get_current_version() < 27 {
+        return Ok(());
+    }
+    let _installed = progress::install(reporter);
+    v027_isolate_sandbox_stores::migrate_instance(id)
+}
+
+/// [`migrate_sandbox_store_for_with`] using the process-wide default reporter,
+/// so the copy narrates itself wherever one is configured.
+pub fn migrate_sandbox_store_for(id: &str) -> Result<()> {
+    migrate_sandbox_store_for_with(id, Some(progress::tracing_reporter()))
+}
+
 pub fn run_migrations() -> Result<()> {
     run_migrations_with(None)
 }
 
 /// Run all pending migrations, sending [`progress::Event`]s to `reporter` so a
-/// long one (store copies, container probes) reads as work, not a hang. A
-/// still-pending sandbox store move is retried too; it reports only the work
-/// it actually does (copies and their outcome), not what stays pending.
+/// long one (store copies, container probes) reads as work, not a hang.
+///
+/// A still-pending sandbox store move is *not* retried here: v027's rows move
+/// when their session next needs a container, or all at once under
+/// [`run_migrations_announced`] for `aoe migrate`. This path only advances the
+/// schema version and reports the migrations it actually runs.
 pub fn run_migrations_with(reporter: Option<progress::Reporter>) -> Result<()> {
     run_migrations_inner(reporter, false)
 }

@@ -302,22 +302,30 @@ the agent's usual config path, so credentials, hooks and conversation history
 belong to one session and `aoe` can resume the right conversation.
 
 Sessions created before this layout shared one agent store per agent (for
-example `~/.claude/sandbox`). The first `aoe` start after upgrading moves them:
-it copies the shared store into a private directory for every sandboxed session,
-removes each session's stopped container so the next launch mounts the copy,
-and deletes the shared store once every session that used it has moved (the
-private copies are the data from then on). Startup prints what it is copying
-and how long it has been running. A large store copied for many sessions can take minutes; a
-session whose container is still running is skipped and moved on a later start,
-after it stops.
+example `~/.claude/sandbox`). Each one moves when you start it: AoE copies the
+shared store into that session's private directory, removes its stopped
+container so the next launch mounts the copy, and deletes the shared store once
+every session that used it has moved (the private copies are the data from then
+on). A large store takes a while, so the first start of a session is slower
+than usual. A session whose container is still running is skipped and moved on
+a later start, after it stops. Trashed and archived sessions stay on the shared
+store. Starting one moves it; restoring or unarchiving alone does not, so run
+`aoe migrate` afterwards if you want it moved before its next start.
 
-To start without waiting, quit and set `AOE_DEFER_SANDBOX_MIGRATION=1` for that
-launch. Sessions then keep using the shared store, and the move is retried on
-the next start without the variable, or on demand with:
+To move every eligible session at once instead of paying for each at its next
+start:
 
 ```bash
 aoe migrate
 ```
+
+This skips trashed and archived sessions, which keep their shared store until
+one of them is started or brought back.
+
+`AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for that launch. A session whose
+container is still running carries on unaffected, on the shared store. One
+whose container is stopped cannot start until its store has moved, so drop the
+variable or run `aoe migrate` before launching it.
 
 ## Worktrees and Sandboxing
 
