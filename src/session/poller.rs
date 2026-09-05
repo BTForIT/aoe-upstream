@@ -72,7 +72,7 @@ const POLLER_REPAIR_REMIND_EVERY: u32 = 10;
 /// (re)started — typically because the process-wide thread budget is spent.
 ///
 /// The daemon and the TUI both walk every registered session on a ~2 s
-/// tick and ask [`crate::session::Instance::repair_session_id_poller_if_needed`]
+/// tick and ask `Instance::repair_session_id_poller_if_needed`
 /// to replace a missing poller. Without a schedule, a fleet over budget
 /// retries and warns for every over-budget session on every tick — the
 /// 2026-09-04 fleet logged ~2.5 warning lines per second from two sessions.
