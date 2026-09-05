@@ -226,12 +226,21 @@ fn rate_limit_resume_marker_resets_at(
     latest_rate_limit: Option<&RateLimitInfo>,
     fallback_resets_at: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
+    // #3688: an exhausted-retries park also continues the interrupted turn
+    // on manual resume. No schedule applies (the reconciler already gave
+    // up), so the marker's timestamp is only the resume-at instant the
+    // breadcrumb reports.
     match latest_status {
         Some(Event::Stopped { reason }) if reason == "rate_limited" => Some(
             latest_rate_limit
                 .and_then(|info| info.resets_at)
                 .unwrap_or(fallback_resets_at),
         ),
+        Some(Event::Stopped { reason })
+            if reason == crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON =>
+        {
+            Some(fallback_resets_at)
+        }
         _ => None,
     }
 }
@@ -489,7 +498,7 @@ pub async fn spawn_acp(
                 crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
                 state
                     .acp_supervisor
-                    .publish_rate_limit_auto_resumed(&id, resets_at);
+                    .publish_rate_limit_auto_resumed(&id, resets_at, true);
             }
             Json(SpawnAcpResponse {
                 session_id: id,
@@ -503,7 +512,7 @@ pub async fn spawn_acp(
                 crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
                 state
                     .acp_supervisor
-                    .publish_rate_limit_auto_resumed(&id, resets_at);
+                    .publish_rate_limit_auto_resumed(&id, resets_at, true);
             }
             Json(SpawnAcpResponse {
                 session_id: id,
@@ -835,6 +844,15 @@ pub async fn shutdown_acp(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
+    // Worker-stopping barrier: submission guard before any teardown, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
     match state.acp_supervisor.shutdown(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => supervisor_error_response("shutdown failed", &e),
@@ -957,6 +975,15 @@ pub async fn switch_acp_agent(
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required").into_response();
     }
+    // Worker-stopping barrier: submission guard before any teardown, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
 
     // Look up the instance first: custom agents are profile-specific, so
     // validation needs the session's source_profile and project_path. This
@@ -1025,6 +1052,12 @@ pub async fn switch_acp_agent(
             format!("shutdown failed before agent switch: {e}"),
         )
             .into_response();
+    }
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            inst.acp_load_session_capable = None;
+        }
     }
 
     let cwd = PathBuf::from(&instance.project_path);
@@ -1334,15 +1367,21 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Claim the session's prompt-submission authority for the rest of the
-    // handler: the decision below and the dispatch it picks must be one
-    // atomic step. Releasing between them let a queue drain read a fold this
-    // prompt had not published into yet, so both delivered and whichever lost
-    // the agent's race came back `agent_busy` after its queue row was already
-    // retired (#3621). Not `instance_lock`, for the reason `prompt_submission`
-    // documents: holding that one here stalls this handler's own resume
-    // (#3172).
-    let _submission = state.session_service.prompt_submission(&id).await;
+    // Claim the session's prompt-submission authority and decide under it, so
+    // every client follows the same send, steer, or queue rules and the
+    // decision and the dispatch it picks are one atomic step. Releasing
+    // between them let a queue drain read a fold this prompt had not published
+    // into yet, so both delivered and whichever lost the agent's race came
+    // back `agent_busy` after its queue row was already retired (#3621).
+    // `woke_idle_dormant` is passed rather than re-read: the wake above
+    // already cleared the marker, so the instance now says "awake".
+    let Ok((_submission, dispatch)) = state
+        .session_service
+        .begin_prompt_submission(&SessionCaller::User, &id, woke_idle_dormant)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could
     // later replay the older interrupted prompt after this newer one (#3028).
@@ -1353,18 +1392,6 @@ pub async fn acp_prompt(
     // and returns. Resume + publish + forward live in the shared service so
     // the plugin host delivers turns through the same path (#2897).
     state.session_service.clear_pending_initial_turn(&id).await;
-    // Decide here so every client follows the same send, steer, or queue rules.
-    let dispatch = {
-        let control = crate::server::acp_ws::fold_control_state(&state, &id).await;
-        let liveness = crate::acp::dispatch::WorkerLiveness {
-            running: state.acp_supervisor.is_running(&id).await,
-            // `touch_on_prompt_and_wake_if_sunk` above already cleared the marker for a
-            // dormant session, so read the pre-clear answer it returned rather
-            // than the instance, which now says "awake".
-            idle_dormant: woke_idle_dormant,
-        };
-        crate::acp::dispatch::decide(&control, liveness)
-    };
     if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
         // Park it on the server-owned queue the turn-end drain already
         // services. A client-minted id reconciles the caller's optimistic row;
@@ -1455,6 +1482,33 @@ pub async fn acp_prompt(
     }
 }
 
+/// Why a diff-comments prompt cannot start a turn right now. Each reason is
+/// transient, and the dialog keeps the user's comments and shows the text, so
+/// the answer is "try again", not a lost review.
+fn diff_comments_not_now(reason: crate::acp::dispatch::QueueReason) -> axum::response::Response {
+    use crate::acp::dispatch::QueueReason;
+    match reason {
+        QueueReason::WorkerDown => {
+            (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+        }
+        QueueReason::TurnActive => (
+            StatusCode::CONFLICT,
+            "the agent is mid-turn; wait for it to finish, then send the comments again",
+        )
+            .into_response(),
+        QueueReason::Cancelling => (
+            StatusCode::CONFLICT,
+            "the turn is still cancelling; send the comments again once it stops",
+        )
+            .into_response(),
+        QueueReason::Compacting => (
+            StatusCode::CONFLICT,
+            "the agent is compacting its context; send the comments again when it finishes",
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /api/sessions/{id}/acp/prompt/diff-comments`: the typed
 /// successor to the diff-comments sentinel hack. The frontend sends the
 /// structured review plus the `assembled_markdown` it previewed; the
@@ -1476,21 +1530,30 @@ pub async fn acp_prompt_diff_comments(
         Err(rej) => return rej.into_response(),
     };
     let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
-    {
-        let instances = state.instances.read().await;
-        if !instances.iter().any(|i| i.id == id) {
-            return (StatusCode::NOT_FOUND, "session not found").into_response();
-        }
-    }
     // This opens a turn (`UserDiffCommentsPrompt` folds to `turn_active`) just
-    // as an ordinary prompt does, so it takes the same submission authority:
-    // otherwise it can publish between a queue drain's idle check and its
-    // send, and the agent rejects whichever of the two it sees second (#3621).
-    let _submission = state.session_service.prompt_submission(&id).await;
-    // Idle-dormant wake: respawn synchronously-reserved + detached so the
-    // send_prompt below waits for the worker instead of 404ing. Mirrors
-    // acp_prompt. See #1748.
-    if woke_idle_dormant {
+    // as an ordinary prompt does, so it takes the same submission authority
+    // and settles the same disposition under it (#3621, #3649).
+    let Ok((_submission, dispatch)) = state
+        .session_service
+        .begin_prompt_submission(&SessionCaller::User, &id, woke_idle_dormant)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    // A typed diff-comments prompt has no queue row to park on, so anything
+    // but send-or-steer is refused here rather than published and then
+    // rejected asynchronously as `agent_busy`, which would strand the card in
+    // the transcript and lose the review the user just wrote.
+    if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
+        return diff_comments_not_now(reason);
+    }
+    // Wake a worker that is not live: the idle-dormant reap (#1748) and the
+    // rate-limit redelivery-cap park (#3688) are both sendable above with no
+    // worker, and the dispatch already refused a cold session that is neither.
+    // Respawn synchronously-reserved + detached so the send_prompt below waits
+    // for the worker instead of 404ing. Mirrors `send_turn`'s `needs_resume`.
+    let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
+    if needs_resume {
         use crate::server::acp_reconciler::ResumeTrigger;
         match crate::server::acp_reconciler::trigger_resume_background(&state.session_service, &id)
             .await
@@ -1515,6 +1578,17 @@ pub async fn acp_prompt_diff_comments(
             }
         }
     }
+    // Gate the publish on the worker actually being there, as `send_turn`
+    // does: a resume that never finishes would otherwise leave a
+    // `UserDiffCommentsPrompt` with no turn behind it, stranding the review
+    // card on "running" (#3172). A live worker makes this a map lookup.
+    if let Err(e) = state.acp_supervisor.wait_until_ready(&id).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("worker_not_ready: {e}"),
+        )
+            .into_response();
+    }
     // Publish the typed event BEFORE forwarding so the replay buffer /
     // on-disk store captures the user's side even if the forward fails,
     // matching acp_prompt.
@@ -1536,7 +1610,7 @@ pub async fn acp_prompt_diff_comments(
     {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         // Retryable worker_not_ready override; mirrors acp_prompt. See #1748.
-        Err(SupervisorError::UnknownSession(_)) if woke_idle_dormant => {
+        Err(SupervisorError::UnknownSession(_)) if needs_resume => {
             (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
         }
         Err(e) => supervisor_error_response("prompt failed", &e),
@@ -2045,6 +2119,7 @@ pub async fn acp_enable(
     instance.resume_intent = crate::session::ResumeIntent::Default;
     instance.status = crate::session::Status::Idle;
     instance.lifecycle_generation = lifecycle_generation;
+    instance.acp_load_session_capable = None;
     {
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|candidate| candidate.id == id) {
@@ -2053,6 +2128,7 @@ pub async fn acp_enable(
                 slot.resume_intent = crate::session::ResumeIntent::Default;
                 slot.status = crate::session::Status::Idle;
                 slot.lifecycle_generation = lifecycle_generation;
+                slot.acp_load_session_capable = None;
             }
         }
     }
@@ -2190,12 +2266,15 @@ pub async fn acp_disable(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
-    {
-        let instances = state.instances.read().await;
-        if !instances.iter().any(|i| i.id == id) {
-            return (StatusCode::NOT_FOUND, "session not found").into_response();
-        }
-    }
+    // Worker-stopping barrier: submission guard before any teardown, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
     let (mut instance, profile) = {
@@ -2271,6 +2350,7 @@ pub async fn acp_disable(
         instance.switch_to_terminal_keep_context();
     } else {
         instance.view = crate::session::View::Terminal;
+        instance.acp_load_session_capable = None;
         // Clear the stored ACP session id: the agent's transcript is
         // tied to the structured view-mode lifecycle. If the user re-enables
         // structured view later, the agent should start a fresh session/new
@@ -2306,6 +2386,7 @@ pub async fn acp_disable(
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.view = crate::session::View::Terminal;
+            slot.acp_load_session_capable = None;
             slot.acp_session_id = persist_acp_session_id.clone();
             slot.import_pending = persist_import_pending;
             if keep_context {
@@ -2803,6 +2884,7 @@ pub async fn acp_replay(
                 session_id: id.clone(),
                 seq,
                 event: Arc::new(event),
+                worker_generation: None,
             })
             .collect();
         (frames, None)
@@ -3414,6 +3496,113 @@ mod tests {
         );
     }
 
+    /// #3688: the recovery lives in `dispatch::decide`, not in one handler,
+    /// so every admission site inherits it. Pinning it here rather than
+    /// through a handler keeps the contract on the shared decision point:
+    /// a handler that starts refusing the park again fails this first.
+    #[tokio::test]
+    async fn exhausted_rate_limit_park_is_sendable_at_the_shared_decision_point() {
+        let mut inst = crate::session::Instance::new("exhausted-shared", "/tmp/aoe-3688-shared");
+        inst.id = "sess-3688-shared".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // A worker-less session with no park parks the prompt, as ever.
+        let (guard, dispatch) = state
+            .session_service
+            .begin_prompt_submission(&SessionCaller::User, &id, false)
+            .await
+            .expect("session exists");
+        assert_eq!(
+            dispatch,
+            crate::acp::dispatch::PromptDispatch::Queued {
+                reason: crate::acp::dispatch::QueueReason::WorkerDown,
+            },
+        );
+        drop(guard);
+
+        assert!(state.acp_supervisor.publish_stopped_if_seq(
+            &id,
+            crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+            0,
+        ));
+        let (_guard, dispatch) = state
+            .session_service
+            .begin_prompt_submission(&SessionCaller::User, &id, false)
+            .await
+            .expect("session exists");
+        assert_eq!(
+            dispatch,
+            crate::acp::dispatch::PromptDispatch::Sent,
+            "the cap park is terminal, so queueing here strands the prompt \
+             the banner told the user to send"
+        );
+    }
+
+    /// #3688: a fresh prompt is the recovery the give-up banner points at, so
+    /// an exhausted park must drive a resume rather than buffer the prompt on
+    /// a queue only a live or idle-dormant worker drains.
+    ///
+    /// No `ResumeReservation` is held here on purpose: one makes `is_running`
+    /// true, which short-circuits the park probe entirely and leaves the test
+    /// asserting nothing about this path. The spawn instead fails on the
+    /// missing project path, and its `AgentStartupError` is the proof that a
+    /// resume ran at all.
+    #[tokio::test]
+    async fn exhausted_rate_limit_prompt_resumes_instead_of_queueing() {
+        let mut inst = crate::session::Instance::new("exhausted-3688", "/tmp/aoe-3688-project");
+        inst.id = "sess-3688".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        assert!(state.acp_supervisor.publish_stopped_if_seq(
+            &id,
+            crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+            0,
+        ));
+
+        let response = acp_prompt(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(PromptRequest {
+                text: "start a fresh retry budget".to_string(),
+                attachments: Vec::new(),
+                prompt_id: None,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the resume could not spawn, which is retryable, not a queued 202"
+        );
+        assert!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .is_empty(),
+            "the recovery prompt must not be stranded on the server queue"
+        );
+        let events = state.acp_event_store.replay_from(&id, 0);
+        assert!(
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::AgentStartupError { .. })),
+            "the park must have driven a resume; without one nothing ever \
+             brings this session back"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::UserPromptSent { .. })),
+            "a prompt with no worker must remain unpublished for retry"
+        );
+    }
+
     /// #3621: deciding a prompt's disposition and acting on it is one step, so
     /// a direct prompt cannot slip between a queue drain's idle check and the
     /// moment its prompt reaches the agent.
@@ -3515,6 +3704,207 @@ mod tests {
             ["prompt"],
             "exactly one prompt reaches the agent; a second would be refused as agent_busy"
         );
+    }
+
+    /// #3688: the diff-comments endpoint is the other user surface that opens
+    /// a turn, and the cap park is terminal, so refusing here loses the review
+    /// the user just wrote with nothing scheduled to make a retry work. It
+    /// must wake the park like an ordinary prompt does. Same no-reservation
+    /// reasoning as the prompt test above.
+    #[tokio::test]
+    async fn diff_comments_on_an_exhausted_park_resume_instead_of_refusing() {
+        let mut inst = crate::session::Instance::new("dc-3688", "/tmp/aoe-3688-diff");
+        inst.id = "sess-3688-diff".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        assert!(state.acp_supervisor.publish_stopped_if_seq(
+            &id,
+            crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+            0,
+        ));
+
+        let response = acp_prompt_diff_comments(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(DiffCommentsPromptRequest {
+                intro: "review".to_string(),
+                outro: String::new(),
+                is_multi_repo: false,
+                comments: Vec::new(),
+                assembled_markdown: "please address these".to_string(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let events = state.acp_event_store.replay_from(&id, 0);
+        assert!(
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::AgentStartupError { .. })),
+            "the review must have driven a resume rather than being refused \
+             against a park nothing un-parks"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::UserDiffCommentsPrompt { .. })),
+            "a review card with no worker behind it must stay unpublished"
+        );
+    }
+
+    /// #3649: the diff-comments endpoint is a turn-starting surface, so it
+    /// must settle a disposition under the submission guard rather than
+    /// publish and forward unconditionally once it gets the guard.
+    ///
+    /// The winner of the guard is standing in for a queue drain that publishes
+    /// its prompt before releasing. `send_prompt` reports success as soon as
+    /// the command is queued, so a loser that forwarded anyway would answer
+    /// 202, leave a `UserDiffCommentsPrompt` card in the transcript, and only
+    /// then have the agent refuse the prompt as `agent_busy`.
+    #[tokio::test]
+    async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("dc-3649", "/tmp/aoe-3649-diff");
+        inst.id = "sess-3649-diff".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+
+        let winner = state.session_service.prompt_submission(&id).await;
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt_diff_comments(
+                    State(state),
+                    Path(id),
+                    Ok(Json(DiffCommentsPromptRequest {
+                        intro: String::new(),
+                        outro: String::new(),
+                        is_multi_repo: false,
+                        comments: Vec::new(),
+                        assembled_markdown: "review this".to_string(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !handler.is_finished(),
+            "diff comments must not decide their disposition while another submission owns the session"
+        );
+
+        // What the winner does before it releases: the publish is the choke
+        // point that flips the fold to `turn_active`.
+        state
+            .acp_supervisor
+            .publish_user_prompt_with_attachments(&id, "the winning turn".into(), &[], None)
+            .await;
+        drop(winner);
+
+        let response = tokio::time::timeout(Duration::from_secs(10), handler)
+            .await
+            .expect("the handler must finish once the winner releases the session")
+            .expect("handler task must not panic");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            *cmds.lock().expect("cmd log mutex poisoned"),
+            Vec::<&'static str>::new(),
+            "nothing may reach the agent: the refusal is the whole point"
+        );
+        let published = state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .any(|(_, e)| matches!(e, Event::UserDiffCommentsPrompt { .. }));
+        assert!(
+            !published,
+            "a refused review must not leave a card in the transcript"
+        );
+    }
+
+    /// The ACP-side half of the #3650 worker-stopping barrier. `shutdown_acp`,
+    /// `switch_acp_agent` and `acp_disable` all tear the worker down, so a
+    /// queue drain mid-delivery must finish first: `send_turn` respawns a
+    /// worker it finds gone, which would undo the shutdown and, for the
+    /// switch, deliver the prompt to the agent the user just switched away
+    /// from.
+    #[tokio::test]
+    async fn worker_stopping_acp_endpoints_wait_for_an_in_flight_submission() {
+        use std::time::Duration;
+
+        async fn call(which: &str, state: Arc<AppState>, id: String) -> axum::response::Response {
+            match which {
+                "shutdown" => shutdown_acp(State(state), Path(id)).await.into_response(),
+                "switch" => switch_acp_agent(
+                    State(state),
+                    Path(id),
+                    Json(SwitchAgentRequest {
+                        target: "codex".to_string(),
+                        model: None,
+                        reason: None,
+                    }),
+                )
+                .await
+                .into_response(),
+                "disable" => acp_disable(State(state), Path(id)).await.into_response(),
+                other => unreachable!("unknown handler {other}"),
+            }
+        }
+
+        for which in ["shutdown", "switch", "disable"] {
+            let mut inst = crate::session::Instance::new("acp-3650", "/tmp/aoe-3650-acp");
+            inst.id = format!("sess-3650-acp-{which}");
+            inst.view = crate::session::View::Structured;
+            inst.status = crate::session::Status::Idle;
+            inst.acp_load_session_capable = Some(true);
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+            let delivering = state.session_service.prompt_submission(&id).await;
+            let handler = tokio::spawn({
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                async move { call(which, state, id).await }
+            });
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !handler.is_finished(),
+                "{which} must not tear the worker down under an in-flight submission"
+            );
+
+            drop(delivering);
+            tokio::time::timeout(Duration::from_secs(10), handler)
+                .await
+                .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"))
+                .unwrap_or_else(|e| panic!("{which} task must not panic: {e}"));
+            if which == "disable" {
+                assert_eq!(
+                    state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|inst| inst.id == id)
+                        .expect("instance")
+                        .acp_load_session_capable,
+                    None,
+                    "disabling ACP must clear runtime-only negotiated capabilities"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3650,6 +4040,22 @@ mod tests {
     fn rate_limit_resume_marker_falls_back_when_rate_limit_event_missing() {
         let stopped = Event::Stopped {
             reason: "rate_limited".to_string(),
+        };
+        let fallback = utc_ts("2099-01-01T00:00:00Z");
+
+        assert_eq!(
+            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
+            Some(fallback)
+        );
+    }
+
+    /// #3688: an exhausted-retries park still resumes manually. The marker
+    /// gates whether the spawn path queues the interrupted prompt, so a
+    /// None here would leave RESUME NOW spawning an idle worker.
+    #[test]
+    fn rate_limit_resume_marker_covers_exhausted_retries_park() {
+        let stopped = Event::Stopped {
+            reason: "rate_limit_exhausted_retries".to_string(),
         };
         let fallback = utc_ts("2099-01-01T00:00:00Z");
 

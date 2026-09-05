@@ -21,12 +21,19 @@ pub(in crate::tui) struct PreviewTextView {
 
 impl PreviewTextView {
     /// True when `(col, row)` lands on a row/col that maps to real
-    /// content. Used to gate drag-select start.
+    /// content. Used to gate drag-select start. Rows in the pane below
+    /// the last painted line are rejected: `screen_to_content` clamps
+    /// them onto the last line, so accepting one would anchor a
+    /// selection on text the user never clicked.
     pub(in crate::tui) fn contains(self, col: u16, row: u16) -> bool {
-        self.total_lines > 0
-            && self
-                .pane
-                .contains(ratatui::layout::Position::from((col, row)))
+        if !self
+            .pane
+            .contains(ratatui::layout::Position::from((col, row)))
+        {
+            return false;
+        }
+        let painted_rows = self.total_lines.saturating_sub(self.first_line);
+        usize::from(row - self.pane.y) < painted_rows
     }
 
     /// Absolute parsed-text index of the line painted on screen row
@@ -217,6 +224,12 @@ impl PreviewCache {
     /// the session, target, generation, and dimensions the content belongs to.
     /// Returns the captured line count so the caller can clamp scroll. Written
     /// only by `apply_worker_capture`; there is no synchronous capture source.
+    /// Whether no frame has landed yet for the displayed session `id`, so
+    /// the render paints nothing rather than a hint about an unknown pane.
+    pub(in crate::tui) fn is_pending_for(&self, id: &str) -> bool {
+        self.session_id.as_deref() != Some(id)
+    }
+
     pub(in crate::tui) fn store_capture(
         &mut self,
         content: String,

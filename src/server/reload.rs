@@ -69,7 +69,9 @@ pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Inst
         fresh.last_error = prior.last_error;
     }
     fresh.session_id_poller = prior.session_id_poller;
+    fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
+    fresh.acp_load_session_capable = prior.acp_load_session_capable;
     fresh
 }
 
@@ -334,7 +336,7 @@ impl PriorById {
 pub(crate) async fn reload_state_instances_from_disk(
     state: &Arc<AppState>,
     fresh: Vec<Instance>,
-    #[cfg(feature = "serve")] live_worker_records: Vec<LiveStructuredWorkerRecord>,
+    live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
     read_epoch: u64,
 ) {
@@ -416,16 +418,13 @@ pub(crate) async fn reload_state_instances_from_disk(
         merged.push(row);
     }
 
-    #[cfg(feature = "serve")]
     let repairs = repair_structured_rows_from_live_workers(&mut merged, live_worker_records);
 
-    #[cfg(feature = "serve")]
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
     drop(current);
 
-    #[cfg(feature = "serve")]
     persist_structured_row_repairs(state, repairs);
 }
 
@@ -449,7 +448,6 @@ pub(crate) async fn reload_state_instances_from_disk(
 /// event handlers are responsible for any post-restart re-emission that
 /// updates these fields for structured sessions; the passive-status
 /// writer at `status_poll_loop` deliberately does not.
-#[cfg(feature = "serve")]
 pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
     for inst in merged.iter_mut() {
         if !inst.is_structured() {
@@ -809,6 +807,7 @@ mod tests {
                     pane_pid: None,
                     pane_title: None,
                     window_activity,
+                    window_size: None,
                 },
             )]);
             let mut instances = vec![on_disk.clone()];
@@ -902,5 +901,16 @@ mod tests {
 
         let merged = merge_runtime_fields(prior, fresh);
         assert_eq!(merged.last_error, None);
+    }
+
+    #[test]
+    fn merge_runtime_fields_preserves_acp_load_session_capability() {
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.acp_load_session_capable = Some(true);
+
+        let fresh = Instance::new("seed", "/tmp/seed");
+        let merged = merge_runtime_fields(prior, fresh);
+
+        assert_eq!(merged.acp_load_session_capable, Some(true));
     }
 }

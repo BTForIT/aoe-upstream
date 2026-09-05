@@ -576,11 +576,7 @@ impl HttpClient {
         Err(classify_resolve_error(status, &text, nonce, session_id))
     }
 
-    /// `GET /api/sessions`. Returns the daemon's session list as
-    /// whatever shape the caller deserialises into. Used by the
-    /// remote-structured view picker so the bespoke `reqwest::Client` it used
-    /// to keep can be retired in favour of the shared auth/header
-    /// plumbing.
+    /// Returns session rows from `GET /api/sessions` using shared authentication.
     pub async fn list_sessions<T: serde::de::DeserializeOwned>(&self) -> Result<Vec<T>, HttpError> {
         let url = format!("{}/api/sessions", self.endpoint.base_url);
         let res = self.auth(self.http.get(&url)).send().await?;
@@ -612,8 +608,7 @@ impl HttpClient {
     /// the daemon already resolves the active profile's value for the web
     /// dashboard. See #3253.
     pub async fn compaction_reminder(&self) -> Result<Option<u8>, HttpError> {
-        /// The two `/api/about` fields the view needs. `ServerAbout` lives
-        /// behind the `serve` feature, so a TUI-only build cannot name it.
+        /// The two `/api/about` fields the view needs.
         #[derive(serde::Deserialize)]
         struct ReminderAbout {
             acp_compaction_reminder: bool,
