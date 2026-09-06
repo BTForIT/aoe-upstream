@@ -18,8 +18,8 @@ use crate::session::config::{GroupByMode, RowTagMode, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
 use crate::tui::components::{
-    format_scroll_indicator, set_prefixed_input_cursor_position, truncate_to_width, HelpOverlay,
-    Preview,
+    format_scroll_indicator, prefix_within_width, set_prefixed_input_cursor_position,
+    truncate_to_width, HelpOverlay, Preview,
 };
 use crate::tui::responsive;
 use crate::tui::styles::{has_min_contrast, Theme};
@@ -701,20 +701,22 @@ fn branch_tag_content(branch: &str, max_width: usize) -> Option<String> {
 /// Compact display code for a profile name, used by the per-row profile tag
 /// in all-profiles view where the full name is too wide.
 ///
-/// Hyphen/underscore-delimited names keep a short lead segment (three
-/// characters or fewer) whole and append the initials of the remaining
-/// segments, so sibling profiles that share an initial stay distinguishable
-/// at a glance (`gna-main` becomes `gnam`, `bsc-main`/`bso-main` become
-/// `bscm`/`bsom`, `wma-work` becomes `wmaw`); a longer lead contributes its
-/// initial only (`forit-backup` becomes `fb`). Single-segment names take
-/// their first three chars (`default` becomes `def`). The code is lowercased
-/// and THEN capped at four terminal cells, measured by display width: a case
-/// expansion (`İ` lowercases to two scalars) or a wide glyph (`界` is two
-/// cells) can therefore never push the fixed-width `[....]` tag past
+/// Hyphen/underscore-delimited names keep a short lead segment (at most
+/// three grapheme clusters) whole and append the first cluster of each
+/// remaining segment, so sibling profiles that share an initial stay
+/// distinguishable at a glance (`gna-main` becomes `gnam`, `bsc-main` and
+/// `bso-main` become `bscm` and `bsom`, `wma-work` becomes `wmaw`); a longer
+/// lead contributes its initial only (`forit-backup` becomes `fb`).
+/// Single-segment names take their first three clusters (`default` becomes
+/// `def`). The code is lowercased and then cut to four terminal cells on a
+/// cluster boundary, measured as a string the way [`RowTag::rendered`]
+/// measures it, so a case expansion (`İ`), a wide glyph (`界`) or an emoji
+/// sequence (`♥️`, `🤝🏽`) never pushes the fixed-width tag past
 /// [`RowTag::max_width`]. The mapping is per-name and deterministic, so two
 /// profiles that collapse to the same code render identically; the full name
 /// still shows in a filtered view's list title and in the New/Restart dialogs.
 pub(crate) fn profile_short_code(profile: &str) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
     const MAX_CELLS: usize = 4;
     let segments: Vec<&str> = profile
         .split(['-', '_'])
@@ -722,42 +724,18 @@ pub(crate) fn profile_short_code(profile: &str) -> String {
         .collect();
     let code: String = match segments.as_slice() {
         [] => String::new(),
-        [single] => single.chars().take(3).collect(),
+        [single] => single.graphemes(true).take(3).collect(),
         [lead, rest @ ..] => {
-            // Keep a short lead segment whole (`gna-main` -> `gnam`,
-            // `bsc-main`/`bso-main` -> `bscm`/`bsom`) so sibling profiles
-            // that share an initial stay distinguishable at a glance; a
-            // longer lead still contributes its initial only
-            // (`forit-backup` -> `fb`).
-            let lead_part: String = if lead.chars().count() <= 3 {
+            let mut code: String = if lead.graphemes(true).count() <= 3 {
                 (*lead).to_string()
             } else {
-                lead.chars().take(1).collect()
+                lead.graphemes(true).take(1).collect()
             };
-            lead_part
-                .chars()
-                .chain(rest.iter().filter_map(|s| s.chars().next()))
-                .take(MAX_CELLS)
-                .collect()
+            code.extend(rest.iter().filter_map(|s| s.graphemes(true).next()));
+            code
         }
     };
-    truncate_to_display_width(&code.to_lowercase(), MAX_CELLS)
-}
-
-/// The longest prefix of `s` that fits in `max_cells` terminal cells
-/// (`unicode-width`), so a tag cap holds on screen and not just in scalars.
-fn truncate_to_display_width(s: &str, max_cells: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for c in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + w > max_cells {
-            break;
-        }
-        used += w;
-        out.push(c);
-    }
-    out
+    prefix_within_width(&code.to_lowercase(), MAX_CELLS).to_string()
 }
 
 /// Format a timestamp as a compact relative age (e.g. `3m`, `2h`, `4d`, `2mo`).
@@ -4857,9 +4835,9 @@ mod tests {
         assert_eq!(profile_short_code("a-b-c-d-e-f"), "abcd");
     }
 
-    /// The four-cell cap is enforced AFTER lowercasing and by display width:
+    /// The four-cell cap is enforced after lowercasing and by display width:
     /// `İ` lowercases to `i` + a combining dot (two scalars, one cell) and
-    /// `界` is one scalar but two cells — neither may widen the tag.
+    /// `界` is one scalar but two cells; neither may widen the tag.
     #[test]
     fn profile_short_code_caps_by_display_width_after_lowercasing() {
         use unicode_width::UnicodeWidthStr;
@@ -4876,6 +4854,45 @@ mod tests {
                 profile_short_code(name).width() <= 4,
                 "{name:?} -> {:?} exceeds four cells",
                 profile_short_code(name)
+            );
+        }
+    }
+
+    /// `UnicodeWidthChar` is not additive across an emoji sequence: `♥` plus
+    /// VS16 measures 1 + 0 per scalar but 2 as a string, and a skin tone
+    /// measures 2 alone but 0 once joined to its base. The cap has to measure
+    /// grapheme-aligned prefixes as a string, the way `RowTag::rendered()`
+    /// does, or the tag over- or under-fills.
+    #[test]
+    fn profile_short_code_measures_width_across_grapheme_clusters() {
+        use unicode_width::UnicodeWidthStr;
+        // Per-scalar sum admits `a` (1 + 0 + 2 + 1 = 4) but the string is 5 cells.
+        assert_eq!(
+            profile_short_code("\u{2665}\u{fe0f}界-a"),
+            "\u{2665}\u{fe0f}界"
+        );
+        // Per-scalar sum (2 + 2) rejects `m`, yet `🤝🏽m` is 3 cells.
+        assert_eq!(
+            profile_short_code("\u{1f91d}\u{1f3fd}-main"),
+            "\u{1f91d}\u{1f3fd}m"
+        );
+        // A segment's initial is its first cluster, so the VS16 that keeps
+        // the heart in emoji presentation travels with it.
+        assert_eq!(
+            profile_short_code("x-\u{2665}\u{fe0f}"),
+            "x\u{2665}\u{fe0f}"
+        );
+        for name in [
+            "\u{2665}\u{fe0f}\u{2665}\u{fe0f}\u{2665}\u{fe0f}",
+            "\u{1f91d}\u{1f3fd}-a-b-c-d",
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}-main",
+            "क्ष-main",
+        ] {
+            let code = profile_short_code(name);
+            assert!(
+                code.width() <= 4,
+                "{name:?} -> {code:?} is {} cells",
+                code.width()
             );
         }
     }
@@ -5088,8 +5105,8 @@ mod tests {
 
     #[test]
     fn row_tag_content_fits_within_max_width() {
-        // RowTag.rendered() right-pads to max_width by display width —
-        // if content ever exceeds max_width the pad is zero and the bracket
+        // RowTag.rendered() right-pads to max_width by display width; if
+        // content ever exceeds max_width the pad is zero and the bracket
         // span jitters. profile_short_code's documented cap of 4 cells is
         // the tightest case to spot-check.
         use unicode_width::UnicodeWidthStr;
