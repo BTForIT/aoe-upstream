@@ -76,7 +76,9 @@ pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> 
 }
 
 async fn list_profiles() -> Result<()> {
-    let profiles = session::list_profiles()?;
+    // Picker order (`default` last); resolution below still uses the plain
+    // enumeration through `resolve_default_profile`.
+    let profiles = session::list_profiles_for_display()?;
 
     if profiles.is_empty() {
         println!("No profiles found.");

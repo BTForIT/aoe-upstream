@@ -435,6 +435,32 @@ pub fn list_profiles() -> Result<Vec<String>> {
     list_profile_names_in(&profiles_dir)
 }
 
+/// Order profiles for a human-facing picker: alphabetical, with a profile
+/// literally named `default` sunk to the end so the catch-all is never the
+/// first thing a picker offers.
+///
+/// Presentation only. [`list_profiles`] stays plainly sorted because
+/// [`config::resolve_default_profile`] takes its first entry as the implicit
+/// profile when `config.default_profile` is unset; reordering there would
+/// silently move implicit commands from `default` to the next profile.
+pub fn sort_profiles_for_display(profiles: &mut [String]) {
+    profiles.sort_by(|a, b| {
+        (a == "default")
+            .cmp(&(b == "default"))
+            .then_with(|| a.cmp(b))
+    });
+}
+
+/// [`list_profiles`] in picker order. Use this for surfaces a human chooses
+/// from (`aoe profile list`, the TUI profile dialogs, `GET /api/profiles`);
+/// everything that resolves or enumerates profiles programmatically keeps
+/// [`list_profiles`]. See [`sort_profiles_for_display`].
+pub fn list_profiles_for_display() -> Result<Vec<String>> {
+    let mut profiles = list_profiles()?;
+    sort_profiles_for_display(&mut profiles);
+    Ok(profiles)
+}
+
 /// Refuse an explicit `-p`/`--profile` that names a profile which does not
 /// exist (#148). Without this, a typo or a session-title-shaped string passed
 /// as `--profile` travels CLI -> `Storage::new` -> [`get_profile_dir`] and
@@ -517,15 +543,10 @@ fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> 
             }
         }
     }
-    // Alphabetical, but always sink a profile literally named "default" to the
-    // end. `default` is the catch-all account profile; pinning it last in every
-    // picker that reads this list (TUI profile dialog, `aoe profile list`, the
-    // web profile list) keeps it from being fat-fingered as a working profile.
-    profiles.sort_by(|a, b| {
-        (a == "default")
-            .cmp(&(b == "default"))
-            .then_with(|| a.cmp(b))
-    });
+    // Plain alphabetical: this is the input to `resolve_default_profile`,
+    // which takes the first entry. Picker-specific ordering lives in
+    // `sort_profiles_for_display`, never here.
+    profiles.sort();
     Ok(profiles)
 }
 
@@ -572,8 +593,7 @@ mod profile_listing_tests {
         let names = list_profile_names_in(&dir).expect("list");
         assert_eq!(
             names,
-            // `default` sinks last (see sort comment); `personal` leads.
-            vec!["personal".to_string(), "default".to_string()],
+            vec!["default".to_string(), "personal".to_string()],
             "symlinked aliases must be invisible to list_profiles; \
              otherwise each alias inflates the all-profiles session list \
              with duplicates of the linked profile's data (the original \
@@ -592,23 +612,44 @@ mod profile_listing_tests {
         fs::write(dir.join("README"), "ignore me").unwrap();
 
         let names = list_profile_names_in(&dir).expect("list");
-        // `default` sinks last; `work` leads.
-        assert_eq!(names, vec!["work".to_string(), "default".to_string()]);
+        assert_eq!(names, vec!["default".to_string(), "work".to_string()]);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn list_profile_names_sinks_default_to_last() {
-        // The picker-ordering contract: every real profile stays alphabetical,
-        // but a profile literally named "default" is always last so it cannot
-        // be fat-fingered as a working profile in the TUI/CLI/web picker.
+    fn list_profile_names_keeps_default_in_plain_order() {
+        // The enumeration is resolution input, so "default" sorts like any
+        // other name here; only `sort_profiles_for_display` sinks it.
         let dir = make_temp_profiles_dir();
         for name in ["default", "aoe-wmw", "forit-main", "zeta"] {
             fs::create_dir(dir.join(name)).unwrap();
         }
 
         let names = list_profile_names_in(&dir).expect("list");
+        assert_eq!(
+            names,
+            vec![
+                "aoe-wmw".to_string(),
+                "default".to_string(),
+                "forit-main".to_string(),
+                "zeta".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sort_profiles_for_display_sinks_default_to_last() {
+        // The picker-ordering contract: every real profile stays alphabetical,
+        // but a profile literally named "default" is always last so it cannot
+        // be fat-fingered as a working profile in the TUI/CLI/web picker.
+        let mut names: Vec<String> = ["zeta", "default", "forit-main", "aoe-wmw"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sort_profiles_for_display(&mut names);
         assert_eq!(
             names,
             vec![
@@ -620,7 +661,14 @@ mod profile_listing_tests {
             "default must sort last; all other profiles stay alphabetical"
         );
 
-        let _ = fs::remove_dir_all(&dir);
+        // Without a "default" entry the order is plain alphabetical, and a
+        // lone "default" is untouched.
+        let mut plain: Vec<String> = ["b", "a"].iter().map(|s| s.to_string()).collect();
+        sort_profiles_for_display(&mut plain);
+        assert_eq!(plain, vec!["a".to_string(), "b".to_string()]);
+        let mut lone = vec!["default".to_string()];
+        sort_profiles_for_display(&mut lone);
+        assert_eq!(lone, vec!["default".to_string()]);
     }
 }
 
@@ -1491,6 +1539,37 @@ mod tests {
 
         let storage = Storage::new_unwatched("default").unwrap();
         assert_eq!(storage.profile(), "default");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_implicit_resolution_ignores_picker_order_on_mixed_registry() {
+        // Regression for the review on #3681: sinking "default" to the end of
+        // the *picker* must not move the implicit profile. With
+        // `profiles/default` + `profiles/work` and no configured default,
+        // every implicit command has always landed on `default` (the first
+        // entry in plain alphabetical order). Only the display helper may
+        // reorder.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
+        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
+
+        assert_eq!(
+            list_profiles().unwrap(),
+            vec!["default".to_string(), "work".to_string()],
+            "list_profiles is the resolution input and stays plainly sorted"
+        );
+        assert_eq!(config::resolve_default_profile(), "default");
+        assert_eq!(
+            get_profile_dir("").unwrap(),
+            dir.join("profiles").join("default")
+        );
+        assert_eq!(
+            list_profiles_for_display().unwrap(),
+            vec!["work".to_string(), "default".to_string()],
+            "only the picker order sinks default"
+        );
     }
 
     #[test]
