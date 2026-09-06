@@ -1198,8 +1198,10 @@ pub struct SessionConfig {
     /// Ceiling on concurrent session-id poller threads in one aoe process
     /// (the daemon or a TUI). Each poller keeps one session's agent
     /// session id live; with more live sessions than this, the overflow's
-    /// ids stop refreshing until another session stops. Process-wide, so it
-    /// is read from the global config only. 0 keeps the default (50).
+    /// ids stop refreshing until another session stops. Process-wide:
+    /// applied once at startup from the effective config of the profile the
+    /// process was launched with, so a change takes effect on the next
+    /// start. 0 keeps the default (50).
     #[serde(default = "default_session_id_poller_max_threads")]
     #[setting(
         label = "Session-id poller threads (restart req.)",

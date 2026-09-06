@@ -409,13 +409,12 @@ async fn run(
     }
 
     // Process-wide poller budget: the daemon and every TUI each run their own
-    // set of session-id poller threads, capped per process. Read from the
-    // global config (the daemon serves all profiles) before any session is
-    // loaded, so the first repair walk already sees the configured ceiling.
+    // set of session-id poller threads, capped per process. Applied from the
+    // launch profile's effective config (global plus that profile's override,
+    // which is where the dashboard persists it) before any session is loaded,
+    // so the first repair walk already sees the configured ceiling.
     agent_of_empires::session::poller::configure_session_id_poller_max_threads(
-        agent_of_empires::session::Config::load_or_warn()
-            .session
-            .session_id_poller_max_threads,
+        agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
     );
 
     // Surface config diagnostics on stderr for user-visible CLI commands

@@ -703,7 +703,10 @@ mod tests {
         let mut restarted = before.clone();
         restarted.omp_capture_generation = Some("generation-b".to_string());
         let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
-        assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+        assert_eq!(
+            poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
         let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
         restarted.session_id_poller = Some(restarted_poller.clone());
         let mut live = before.clone();

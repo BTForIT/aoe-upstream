@@ -3,11 +3,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, LazyLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
-/// Global count of active session-id poller threads for budget enforcement
-static ACTIVE_POLLER_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Default ceiling on concurrent session-id poller threads.
 ///
@@ -18,46 +16,115 @@ static ACTIVE_POLLER_COUNT: AtomicU32 = AtomicU32::new(0);
 /// `[session] session_id_poller_max_threads`.
 pub const DEFAULT_SESSION_ID_POLLER_MAX_THREADS: u32 = 50;
 
-/// The live ceiling, process-wide. Seeded with the default; the configured
+/// A budget of session-id poller threads: how many are running and the
+/// ceiling they may not exceed.
+///
+/// One instance serves the whole process ([`PROCESS_BUDGET`]); tests that
+/// assert exact counts pin a private one (`test_support::IsolatedBudget`)
+/// so they neither observe nor disturb pollers started elsewhere.
+#[derive(Debug)]
+pub struct PollerBudget {
+    active: AtomicU32,
+    max: AtomicU32,
+}
+
+impl PollerBudget {
+    const fn new(max: u32) -> Self {
+        Self {
+            active: AtomicU32::new(0),
+            max: AtomicU32::new(max),
+        }
+    }
+
+    /// Set the ceiling. 0 means "unset" and keeps the default, so an empty
+    /// or zeroed config key can never freeze every session id.
+    fn set_max(&self, max: u32) {
+        let max = if max == 0 {
+            DEFAULT_SESSION_ID_POLLER_MAX_THREADS
+        } else {
+            max
+        };
+        self.max.store(max, Ordering::SeqCst);
+    }
+
+    fn max(&self) -> u32 {
+        self.max.load(Ordering::SeqCst)
+    }
+
+    fn active(&self) -> u32 {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// Atomically check the ceiling and take a slot. `None` at capacity.
+    fn try_acquire(self: &Arc<Self>) -> Option<PollerCountGuard> {
+        let mut current = self.active.load(Ordering::SeqCst);
+        loop {
+            if current >= self.max() {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(PollerCountGuard {
+                        budget: Arc::clone(self),
+                    })
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+/// The process-wide budget. Seeded with the default ceiling; the configured
 /// value is applied once at startup by
 /// [`configure_session_id_poller_max_threads`].
-static SESSION_ID_POLLER_MAX_THREADS: AtomicU32 =
-    AtomicU32::new(DEFAULT_SESSION_ID_POLLER_MAX_THREADS);
+static PROCESS_BUDGET: LazyLock<Arc<PollerBudget>> =
+    LazyLock::new(|| Arc::new(PollerBudget::new(DEFAULT_SESSION_ID_POLLER_MAX_THREADS)));
+
+/// The budget pollers created on this thread draw from: the process budget,
+/// unless a test has pinned a private one.
+fn current_budget() -> Arc<PollerBudget> {
+    #[cfg(test)]
+    if let Some(budget) = test_support::pinned_budget() {
+        return budget;
+    }
+    Arc::clone(&PROCESS_BUDGET)
+}
 
 /// Apply the configured poller-thread ceiling for this process.
 ///
 /// A value of 0 is treated as "unset" and keeps the default, so an empty or
 /// zeroed config key can never freeze every session id.
 pub fn configure_session_id_poller_max_threads(max: u32) {
-    let max = if max == 0 {
-        DEFAULT_SESSION_ID_POLLER_MAX_THREADS
-    } else {
-        max
-    };
-    SESSION_ID_POLLER_MAX_THREADS.store(max, Ordering::SeqCst);
+    current_budget().set_max(max);
 }
 
 /// The current poller-thread ceiling.
 pub fn session_id_poller_max_threads() -> u32 {
-    SESSION_ID_POLLER_MAX_THREADS.load(Ordering::SeqCst)
+    current_budget().max()
+}
+
+/// The configured ceiling for a process launched under `profile`: the
+/// global `[session] session_id_poller_max_threads` with that profile's
+/// override applied, the way every other global-only session field is
+/// consumed. The dashboard writes global-only core fields through
+/// `PATCH /api/profiles/<name>/settings`, so a value saved from Settings
+/// lives in the profile's `config.toml` and a global-file-only read would
+/// miss it. The value is applied once at startup; a change needs a restart.
+pub fn configured_session_id_poller_max_threads(profile: &str) -> u32 {
+    crate::session::resolve_config_or_warn(profile)
+        .session
+        .session_id_poller_max_threads
 }
 
 /// `(active, max)` for the session-id poller thread budget.
 pub fn session_id_poller_budget() -> (u32, u32) {
-    (
-        ACTIVE_POLLER_COUNT.load(Ordering::SeqCst),
-        session_id_poller_max_threads(),
-    )
-}
-
-/// True when no further poller thread can be started right now.
-///
-/// Callers that re-check a dead poller on a timer consult this before
-/// attempting a start, so an over-budget fleet does not pay a failed spawn
-/// plus a warning line per session per tick.
-pub fn session_id_poller_budget_exhausted() -> bool {
-    let (active, max) = session_id_poller_budget();
-    active >= max
+    let budget = current_budget();
+    (budget.active(), budget.max())
 }
 
 /// First retry delay after a poller could not be (re)started.
@@ -140,36 +207,17 @@ impl PollerRepairBackoff {
     }
 }
 
-/// RAII guard that decrements `ACTIVE_POLLER_COUNT` on drop.
+/// RAII guard that returns its slot to the budget on drop.
 ///
-/// Ensures the counter is always decremented even if the poller thread panics,
+/// Ensures the count is always decremented even if the poller thread panics,
 /// preventing permanent budget exhaustion.
-struct PollerCountGuard;
-
-impl PollerCountGuard {
-    /// Atomically check the budget and increment. Returns `None` if at capacity.
-    fn try_acquire() -> Option<Self> {
-        let mut current = ACTIVE_POLLER_COUNT.load(Ordering::SeqCst);
-        loop {
-            if current >= session_id_poller_max_threads() {
-                return None;
-            }
-            match ACTIVE_POLLER_COUNT.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return Some(Self),
-                Err(actual) => current = actual,
-            }
-        }
-    }
+struct PollerCountGuard {
+    budget: Arc<PollerBudget>,
 }
 
 impl Drop for PollerCountGuard {
     fn drop(&mut self) {
-        ACTIVE_POLLER_COUNT.fetch_sub(1, Ordering::SeqCst);
+        self.budget.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -177,6 +225,23 @@ const POLL_INITIAL_INTERVAL: Duration = Duration::from_secs(2);
 const POLL_MAX_INTERVAL: Duration = Duration::from_secs(60);
 const POLL_BACKOFF_FACTOR: f64 = 1.5;
 const POLL_STABLE_THRESHOLD: u32 = 3;
+
+/// Outcome of [`SessionPoller::start`].
+///
+/// Only [`Spawned`](Self::Spawned) leaves a thread running. The other
+/// variants are distinct so a caller can tell a spent budget (retry later)
+/// from an OS spawn failure (warn) and from a duplicate start (ignore).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollerSpawn {
+    /// The polling thread is running.
+    Spawned,
+    /// This poller already owns a thread; the duplicate start was ignored.
+    AlreadyStarted,
+    /// The process-wide poller-thread budget is spent; nothing was spawned.
+    BudgetExhausted,
+    /// The OS refused to create the thread.
+    SpawnFailed,
+}
 
 /// Manages adaptive polling intervals that back off when no changes are detected
 #[derive(Debug)]
@@ -334,6 +399,9 @@ fn poll_resolved_target<T>(
 /// and `Instance::restart_with_size`.
 pub struct SessionPoller {
     session_name: String,
+    /// The budget this poller's thread is counted against, fixed at
+    /// construction so the slot is returned to the budget it was taken from.
+    budget: Arc<PollerBudget>,
     cmd_tx: mpsc::Sender<PollCommand>,
     cmd_rx: Option<mpsc::Receiver<PollCommand>>,
     result_tx: mpsc::Sender<(String, SessionIdObservation)>,
@@ -358,6 +426,7 @@ impl SessionPoller {
         let (result_tx, result_rx) = mpsc::channel();
         Self {
             session_name,
+            budget: current_budget(),
             cmd_tx,
             cmd_rx: Some(cmd_rx),
             result_tx,
@@ -369,15 +438,16 @@ impl SessionPoller {
 
     /// Start the polling thread with the given callbacks.
     ///
-    /// Returns `true` if the thread was successfully spawned, `false` if the
-    /// poller was already started, the thread budget was exhausted, or spawning failed.
+    /// Returns [`PollerSpawn::Spawned`] when the thread is running; the other
+    /// variants say why it is not (duplicate start, budget spent, or the OS
+    /// refused the thread).
     pub fn start(
         &mut self,
         instance_id: String,
         poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static>,
         on_change: Box<dyn Fn(&str) + Send + 'static>,
         initial_known: Option<String>,
-    ) -> bool {
+    ) -> PollerSpawn {
         self.start_observations(
             instance_id,
             Box::new(move |_| poll_fn().map(SessionIdObservation::unguarded)),
@@ -392,7 +462,7 @@ impl SessionPoller {
         poll_fn: SessionIdPollFn,
         on_change: Box<dyn Fn(&str) + Send + 'static>,
         initial_known: Option<SessionIdObservation>,
-    ) -> bool {
+    ) -> PollerSpawn {
         let cmd_rx = match self.cmd_rx.take() {
             Some(rx) => rx,
             None => {
@@ -400,14 +470,14 @@ impl SessionPoller {
                     "Poller for {} already started, ignoring duplicate start",
                     instance_id
                 );
-                return false;
+                return PollerSpawn::AlreadyStarted;
             }
         };
 
-        let _guard = match PollerCountGuard::try_acquire() {
+        let _guard = match self.budget.try_acquire() {
             Some(g) => g,
             None => {
-                let (active, max) = session_id_poller_budget();
+                let (active, max) = (self.budget.active(), self.budget.max());
                 tracing::warn!(target: "session.create",
                     "Session-id poller budget exhausted ({}/{}), skipping poller for {}; \
                      its session id will not refresh until another session stops \
@@ -417,7 +487,7 @@ impl SessionPoller {
                     instance_id,
                 );
                 self.cmd_rx = Some(cmd_rx);
-                return false;
+                return PollerSpawn::BudgetExhausted;
             }
         };
 
@@ -511,7 +581,7 @@ impl SessionPoller {
         match handle {
             Ok(h) => {
                 self.handle = Some(h);
-                true
+                PollerSpawn::Spawned
             }
             Err(e) => {
                 tracing::warn!(target: "session.create", "Failed to spawn poller thread {}: {}", thread_label, e);
@@ -523,7 +593,7 @@ impl SessionPoller {
                 self.result_tx = result_tx;
                 self.result_rx = Some(result_rx);
                 self.pending_observation = None;
-                false
+                PollerSpawn::SpawnFailed
             }
         }
     }
@@ -631,36 +701,74 @@ impl Default for SessionPoller {
     }
 }
 
-/// Test-only handles on the process-wide budget, for callers outside this
-/// module (instance repair tests) that must drive it deterministically.
+/// Test-only budget isolation.
+///
+/// `#[serial]` only coordinates tests that take the same lock; an
+/// unannotated test that starts a real poller still shares the process
+/// budget, so pinning that budget's counters would race it. A test that
+/// needs exact counts pins a private [`PollerBudget`] for its own thread
+/// instead: pollers it constructs draw from that budget, every other thread
+/// keeps using the process one.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use std::cell::RefCell;
 
-    /// Pins the budget to "spent" (ceiling 1, one slot taken) and restores
-    /// both counters on drop. Pair with `#[serial]`: the budget is global.
-    pub(crate) struct BudgetExhausted {
-        prev_count: u32,
-        prev_max: u32,
+    thread_local! {
+        static PINNED: RefCell<Option<Arc<PollerBudget>>> = const { RefCell::new(None) };
     }
 
-    impl BudgetExhausted {
-        pub(crate) fn pin() -> Self {
-            let prev_count = ACTIVE_POLLER_COUNT.load(Ordering::SeqCst);
-            let prev_max = session_id_poller_max_threads();
-            SESSION_ID_POLLER_MAX_THREADS.store(1, Ordering::SeqCst);
-            ACTIVE_POLLER_COUNT.store(1, Ordering::SeqCst);
-            Self {
-                prev_count,
-                prev_max,
-            }
+    pub(super) fn pinned_budget() -> Option<Arc<PollerBudget>> {
+        PINNED.with(|slot| slot.borrow().clone())
+    }
+
+    /// A private budget for the current thread, unpinned on drop.
+    pub(crate) struct IsolatedBudget {
+        budget: Arc<PollerBudget>,
+    }
+
+    impl IsolatedBudget {
+        /// Pin a fresh budget (no active pollers) with the given ceiling.
+        pub(crate) fn with_ceiling(max: u32) -> Self {
+            let budget = Arc::new(PollerBudget::new(max));
+            PINNED.with(|slot| {
+                assert!(
+                    slot.borrow().is_none(),
+                    "a budget is already pinned on this thread"
+                );
+                *slot.borrow_mut() = Some(Arc::clone(&budget));
+            });
+            Self { budget }
+        }
+
+        /// Pin a budget that is already spent (ceiling 1, one slot taken).
+        pub(crate) fn exhausted() -> Self {
+            let pinned = Self::with_ceiling(1);
+            pinned.set_active(1);
+            pinned
+        }
+
+        pub(crate) fn active(&self) -> u32 {
+            self.budget.active()
+        }
+
+        pub(crate) fn exhausted_now(&self) -> bool {
+            self.budget.active() >= self.budget.max()
+        }
+
+        /// Pretend `n` pollers are running (slots no guard will return).
+        pub(crate) fn set_active(&self, n: u32) {
+            self.budget.active.store(n, Ordering::SeqCst);
+        }
+
+        pub(super) fn try_acquire(&self) -> Option<PollerCountGuard> {
+            self.budget.try_acquire()
         }
     }
 
-    impl Drop for BudgetExhausted {
+    impl Drop for IsolatedBudget {
         fn drop(&mut self) {
-            ACTIVE_POLLER_COUNT.store(self.prev_count, Ordering::SeqCst);
-            SESSION_ID_POLLER_MAX_THREADS.store(self.prev_max, Ordering::SeqCst);
+            PINNED.with(|slot| *slot.borrow_mut() = None);
         }
     }
 }
@@ -677,62 +785,132 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Restores `ACTIVE_POLLER_COUNT` to its original value on drop.
-    struct CountRestorer(u32);
-    impl Drop for CountRestorer {
-        fn drop(&mut self) {
-            ACTIVE_POLLER_COUNT.store(self.0, Ordering::SeqCst);
-        }
-    }
-
-    /// Restores the configured ceiling to its original value on drop.
-    struct MaxRestorer(u32);
-    impl Drop for MaxRestorer {
-        fn drop(&mut self) {
-            SESSION_ID_POLLER_MAX_THREADS.store(self.0, Ordering::SeqCst);
-        }
-    }
-
     #[test]
-    #[serial]
     fn configured_ceiling_bounds_the_budget() {
-        let _restore_max = MaxRestorer(session_id_poller_max_threads());
-        let _restore_count = CountRestorer(ACTIVE_POLLER_COUNT.load(Ordering::SeqCst));
+        let budget =
+            test_support::IsolatedBudget::with_ceiling(DEFAULT_SESSION_ID_POLLER_MAX_THREADS);
 
         configure_session_id_poller_max_threads(3);
         assert_eq!(session_id_poller_max_threads(), 3);
-        ACTIVE_POLLER_COUNT.store(2, Ordering::SeqCst);
-        assert!(!session_id_poller_budget_exhausted());
+        budget.set_active(2);
+        assert!(!budget.exhausted_now());
         assert_eq!(session_id_poller_budget(), (2, 3));
-        let guard = PollerCountGuard::try_acquire();
+        let guard = budget.try_acquire();
         assert!(
             guard.is_some(),
             "third slot is within the configured ceiling"
         );
-        assert!(session_id_poller_budget_exhausted());
+        assert!(budget.exhausted_now());
         assert!(
-            PollerCountGuard::try_acquire().is_none(),
+            budget.try_acquire().is_none(),
             "fourth slot exceeds the configured ceiling"
         );
         drop(guard);
-        assert!(!session_id_poller_budget_exhausted());
+        assert!(!budget.exhausted_now());
 
         // Raising the ceiling at runtime admits the waiting session.
-        ACTIVE_POLLER_COUNT.store(50, Ordering::SeqCst);
+        budget.set_active(50);
         configure_session_id_poller_max_threads(400);
-        assert!(!session_id_poller_budget_exhausted());
-        assert!(PollerCountGuard::try_acquire().is_some());
+        assert!(!budget.exhausted_now());
+        assert!(budget.try_acquire().is_some());
     }
 
     #[test]
-    #[serial]
     fn zero_ceiling_keeps_the_default() {
-        let _restore_max = MaxRestorer(session_id_poller_max_threads());
+        let _budget = test_support::IsolatedBudget::with_ceiling(7);
         configure_session_id_poller_max_threads(0);
         assert_eq!(
             session_id_poller_max_threads(),
             DEFAULT_SESSION_ID_POLLER_MAX_THREADS
         );
+    }
+
+    /// The ceiling a process applies is the effective one for its launch
+    /// profile — global `[session]` plus that profile's override — the way
+    /// every other global-only session field is consumed. The dashboard
+    /// writes global-only core fields through
+    /// `PATCH /api/profiles/<name>/settings`, so a read of the global file
+    /// alone would miss a value saved from Settings.
+    #[test]
+    #[serial]
+    fn configured_ceiling_is_the_launch_profiles_effective_value() {
+        let home = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::write(
+            app.join("config.toml"),
+            "[session]\nsession_id_poller_max_threads = 7\n",
+        )
+        .unwrap();
+        let tuned = app.join("profiles").join("tuned");
+        std::fs::create_dir_all(&tuned).unwrap();
+        std::fs::write(
+            tuned.join("config.toml"),
+            "[session]\nsession_id_poller_max_threads = 9\n",
+        )
+        .unwrap();
+
+        assert_eq!(configured_session_id_poller_max_threads("tuned"), 9);
+        assert_eq!(
+            configured_session_id_poller_max_threads("untouched"),
+            7,
+            "a profile without an override inherits the global value"
+        );
+    }
+
+    /// A test pins a budget of its own: pollers created on its thread draw
+    /// from it, pollers on any other thread keep drawing from the process
+    /// budget, so exact-count assertions hold without a serial lock and a
+    /// pinned ceiling never starves an unrelated test.
+    #[test]
+    fn isolated_budget_does_not_share_slots_with_the_process_budget() {
+        let budget = test_support::IsolatedBudget::with_ceiling(1);
+        assert_eq!(session_id_poller_budget(), (0, 1));
+
+        let mut first = SessionPoller::new("iso-a".to_string());
+        assert_eq!(
+            first.start(
+                "iso-a".to_string(),
+                Box::new(|| Some("id".to_string())),
+                Box::new(|_| {}),
+                None,
+            ),
+            PollerSpawn::Spawned
+        );
+        assert_eq!(budget.active(), 1);
+        assert_eq!(session_id_poller_budget(), (1, 1));
+
+        let mut second = SessionPoller::new("iso-b".to_string());
+        assert_eq!(
+            second.start(
+                "iso-b".to_string(),
+                Box::new(|| Some("id".to_string())),
+                Box::new(|_| {}),
+                None,
+            ),
+            PollerSpawn::BudgetExhausted,
+            "the isolated ceiling is the one this thread's pollers see"
+        );
+
+        // Another thread (an unannotated test, in practice) is unaffected by
+        // this thread's pinned, exhausted budget.
+        let elsewhere = std::thread::spawn(|| {
+            let mut poller = SessionPoller::new("process".to_string());
+            let outcome = poller.start(
+                "process".to_string(),
+                Box::new(|| Some("id".to_string())),
+                Box::new(|_| {}),
+                None,
+            );
+            poller.stop();
+            outcome
+        })
+        .join()
+        .unwrap();
+        assert_eq!(elsewhere, PollerSpawn::Spawned);
+
+        first.stop();
+        assert_eq!(budget.active(), 0, "the guard returns the isolated slot");
     }
 
     #[test]
@@ -1026,19 +1204,18 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_thread_budget_cap() {
-        let _restore_count = CountRestorer(ACTIVE_POLLER_COUNT.load(Ordering::SeqCst));
-        ACTIVE_POLLER_COUNT.store(session_id_poller_max_threads(), Ordering::SeqCst);
+        let _budget = test_support::IsolatedBudget::exhausted();
 
         let mut poller = SessionPoller::new("test-session".to_string());
-        poller.start(
+        let outcome = poller.start(
             "test-budget".to_string(),
             Box::new(|| Some("id".to_string())),
             Box::new(|_| {}),
             None,
         );
 
+        assert_eq!(outcome, PollerSpawn::BudgetExhausted);
         assert!(
             !poller.is_running(),
             "poller should not have spawned when budget exhausted"
@@ -1053,7 +1230,7 @@ mod tests {
     #[serial]
     fn test_poller_is_running_after_start() {
         let mut poller = SessionPoller::new("test-session".to_string());
-        poller.start(
+        let outcome = poller.start(
             "test-running".to_string(),
             Box::new(|| {
                 std::thread::sleep(Duration::from_millis(10));
@@ -1063,13 +1240,42 @@ mod tests {
             None,
         );
 
+        assert_eq!(outcome, PollerSpawn::Spawned);
         assert!(poller.is_running(), "poller should be running after start");
         poller.stop();
     }
 
     #[test]
-    #[serial]
+    fn test_duplicate_start_is_reported_not_spawned() {
+        let _budget = test_support::IsolatedBudget::with_ceiling(1);
+        let mut poller = SessionPoller::new("test-session".to_string());
+        assert_eq!(
+            poller.start(
+                "test-dup".to_string(),
+                Box::new(|| Some("id".to_string())),
+                Box::new(|_| {}),
+                None,
+            ),
+            PollerSpawn::Spawned
+        );
+        assert_eq!(
+            poller.start(
+                "test-dup".to_string(),
+                Box::new(|| Some("id".to_string())),
+                Box::new(|_| {}),
+                None,
+            ),
+            PollerSpawn::AlreadyStarted,
+            "a second start on a live poller is ignored, not a spawn failure"
+        );
+        assert!(poller.is_running());
+        poller.stop();
+    }
+
+    #[test]
     fn test_poller_cleanup_decrements_counter() {
+        let budget =
+            test_support::IsolatedBudget::with_ceiling(DEFAULT_SESSION_ID_POLLER_MAX_THREADS);
         let poll_count = Arc::new(Mutex::new(0u32));
         let poll_count_clone = poll_count.clone();
 
@@ -1087,9 +1293,9 @@ mod tests {
         // Wait for the immediate first poll to run
         std::thread::sleep(Duration::from_millis(100));
 
-        let count_before_stop = ACTIVE_POLLER_COUNT.load(Ordering::SeqCst);
+        let count_before_stop = budget.active();
         poller.stop();
-        let count_after_stop = ACTIVE_POLLER_COUNT.load(Ordering::SeqCst);
+        let count_after_stop = budget.active();
 
         assert!(
             count_after_stop < count_before_stop,

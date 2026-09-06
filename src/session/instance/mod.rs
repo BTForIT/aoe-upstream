@@ -68,6 +68,7 @@ pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 pub(crate) use omp::persist_omp_session_to_storage;
+pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome};
 pub(crate) use resume::ResumeAttemptPolicy;
 pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
