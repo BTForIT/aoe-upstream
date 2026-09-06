@@ -102,7 +102,7 @@ pub(super) fn resolved_acp_config(
     profile: Option<&str>,
 ) -> Option<crate::session::config::AcpConfig> {
     match profile {
-        Some(p) => Some(crate::session::profile_config::resolve_config_or_warn(p).acp),
+        Some(p) => Some(crate::session::config::profile_config::resolve_config_or_warn(p).acp),
         None => crate::session::load_config().ok().flatten().map(|c| c.acp),
     }
 }
@@ -837,6 +837,7 @@ pub(super) async fn run_connection_task<W, R>(
                     image: prompt_caps.image,
                     audio: prompt_caps.audio,
                     embedded_context: prompt_caps.embedded_context,
+                    load_session: Some(load_session_capable),
                     steering: steering_capable,
                 })
                 .await;

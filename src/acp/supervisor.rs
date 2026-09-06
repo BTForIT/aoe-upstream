@@ -21,6 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -215,6 +216,15 @@ pub trait BroadcastSink: Send + Sync + 'static {
         self.publish(session_id, seq, event);
         true
     }
+    /// Publish an event the drain task pumped out of a worker, tagging the
+    /// broadcast frame with the generation of the worker that authored it.
+    /// The drain task is the only publisher with that provenance; every
+    /// other caller goes through `publish` and produces an untagged frame.
+    /// Default drops the tag, which is right for sinks with no broadcast
+    /// channel behind them (test fixtures): nothing downstream can read it.
+    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, _generation: u64) {
+        self.publish(session_id, seq, event);
+    }
     /// Drop all stored events for a session. Used by the import path to clear
     /// any partial replay from a prior failed attempt before re-seeding, run
     /// only after the worker slot is reserved so a duplicate spawn that hits
@@ -295,12 +305,26 @@ struct WorkerHandle {
     /// Background task draining events from the client. Aborted on
     /// shutdown.
     drain_task: JoinHandle<()>,
+    /// Identifies this installed worker across shutdown and replacement.
+    generation: u64,
     /// Restart bookkeeping: timestamps of recent respawns (post-
     /// initial-spawn). Used by the watchdog to enforce
     /// `MAX_RESPAWNS_IN_WINDOW`. Empty on first spawn so the initial
     /// boot doesn't consume the budget.
     restart_history: Vec<Instant>,
     kind: WorkerKind,
+}
+/// Install a respawned client and advance both generation views together.
+fn replace_worker_client(
+    handle: &mut WorkerHandle,
+    client: AcpClient,
+    worker_generation: &mut u64,
+    next_worker_generation: &AtomicU64,
+) {
+    let generation = next_worker_generation.fetch_add(1, Ordering::Relaxed);
+    handle.client = Arc::new(client);
+    handle.generation = generation;
+    *worker_generation = generation;
 }
 
 /// Per-session monotonically-increasing seq counter. Lives at the
@@ -358,6 +382,7 @@ pub struct Supervisor<S: BroadcastSink> {
     registry: Arc<Mutex<AgentRegistry>>,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
     next_seqs: Arc<SeqMap>,
+    next_worker_generation: Arc<AtomicU64>,
     /// Reservation map: a session_id present here means another task is
     /// mid-resume (spawn OR attach) for it. The `ResumeKind` lets the
     /// capacity check distinguish fresh spawns (which contribute to the
@@ -595,7 +620,7 @@ fn resolve_mcp_layers(
     profile: Option<&str>,
     cwd: &std::path::Path,
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
-    use crate::session::mcp_model::{resolve_effective, summarize};
+    use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
     // One resolver for forwarding and the management surfaces (#1996): assemble
     // the trust-gated, provenance-tagged effective set, then convert only the
@@ -744,6 +769,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             next_seqs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_worker_generation: Arc::new(AtomicU64::new(1)),
             pending_resumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_resumes: Arc::new(std::sync::Mutex::new(HashSet::new())),
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -1004,10 +1030,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         let profile = profile.to_string();
         let project_path = project_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::session::repo_config::resolve_config_with_repo_or_warn(&profile, &project_path)
-                .acp
-                .resolved_default_agent()
-                .to_string()
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &project_path,
+            )
+            .acp
+            .resolved_default_agent()
+            .to_string()
         })
         .await
         .unwrap_or_else(|_| crate::session::config::DEFAULT_ACP_AGENT.to_string())
@@ -1028,7 +1057,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         tokio::task::spawn_blocking(move || {
             crate::acp::inherited_acp_base(
                 &tool,
-                &crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                     &profile,
                     &project_path,
                 )
@@ -1052,11 +1081,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         let profile = profile.to_string();
         let project_path = project_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::session::repo_config::resolve_config_with_repo_or_warn(&profile, &project_path)
-                .session
-                .agent_acp_cmd
-                .get(&tool)
-                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&tool, cmd).is_ok())
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &project_path,
+            )
+            .session
+            .agent_acp_cmd
+            .get(&tool)
+            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&tool, cmd).is_ok())
         })
         .await
         .unwrap_or(false)
@@ -1132,7 +1164,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// next pass. The guard is released before `sink.publish`, matching every
     /// other publisher, so a SQLite write never runs under it.
     ///
-    /// Used by the reconciler's terminal-repair pass (#3190).
+    /// Used by the reconciler's terminal-repair pass (#3190) and its
+    /// rate-limit redelivery cap (#3688).
     pub fn publish_stopped_if_seq(
         &self,
         session_id: &str,
@@ -1241,8 +1274,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: &str,
         resets_at: chrono::DateTime<chrono::Utc>,
+        manual: bool,
     ) -> u64 {
-        self.publish_next(session_id, &Event::RateLimitAutoResumed { resets_at })
+        self.publish_next(
+            session_id,
+            &Event::RateLimitAutoResumed { resets_at, manual },
+        )
     }
 
     /// Like `shutdown` but waits for the runner process to actually exit
@@ -1658,7 +1695,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let cwd_for_cfg = cwd.clone();
         let (resolved_cfg, policy) = tokio::task::spawn_blocking(move || {
             (
-                crate::session::repo_config::resolve_config_with_repo_or_warn(
+                crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                     &profile_for_cfg,
                     &cwd_for_cfg,
                 ),
@@ -1760,8 +1797,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             let session_for_hook = session_id.clone();
             let tool_for_hook = tool.clone();
             let minted = tokio::task::spawn_blocking(move || {
-                let commands =
-                    crate::session::repo_config::resolve_before_session_hooks(&profile_for_hook);
+                let commands = crate::session::config::repo_config::resolve_before_session_hooks(
+                    &profile_for_hook,
+                );
                 if commands.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -1778,7 +1816,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         cwd_for_hook.to_string_lossy().to_string(),
                     ),
                 ];
-                crate::session::repo_config::run_before_session_hooks(
+                crate::session::config::repo_config::run_before_session_hooks(
                     &commands,
                     &cwd_for_hook,
                     &hook_env,
@@ -1939,11 +1977,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let worker_generation = self
+            .next_worker_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let drain_task = self.start_drain_task(session_id.clone(), inbound, worker_generation);
         let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
             WorkerHandle {
+                generation: worker_generation,
                 client,
                 drain_task,
                 // Empty: the initial spawn doesn't count toward the
@@ -2002,15 +2044,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         initial_inbound: mpsc::Receiver<Event>,
+        worker_generation: u64,
     ) -> JoinHandle<()> {
         let sink = Arc::clone(&self.sink);
         let workers = Arc::clone(&self.workers);
         let next_seqs = Arc::clone(&self.next_seqs);
         let incompatible_binaries = Arc::clone(&self.incompatible_binaries);
+        let next_worker_generation = Arc::clone(&self.next_worker_generation);
         crate::task_util::spawn_supervised(
             "supervisor.drain",
             crate::task_util::PanicPolicy::Log,
             async move {
+                let mut worker_generation = worker_generation;
                 let mut inbound = initial_inbound;
                 loop {
                     // Tracks whether the connection task ended because the
@@ -2124,7 +2169,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                             _ => {}
                         }
                         let seq = next_seq(&next_seqs, &session_id);
-                        sink.publish(&session_id, seq, &event);
+                        sink.publish_from_worker(&session_id, seq, &event, worker_generation);
                     }
 
                     // Channel closed: the agent's connection task ended.
@@ -2376,7 +2421,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         let tool_for_hook = respawn_config.tool.clone();
                         let minted = tokio::task::spawn_blocking(move || {
                             let commands =
-                                crate::session::repo_config::resolve_before_session_hooks(
+                                crate::session::config::repo_config::resolve_before_session_hooks(
                                     &profile_for_hook,
                                 );
                             if commands.is_empty() {
@@ -2391,7 +2436,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                     cwd_for_hook.to_string_lossy().to_string(),
                                 ),
                             ];
-                            crate::session::repo_config::run_before_session_hooks(
+                            crate::session::config::repo_config::run_before_session_hooks(
                                 &commands,
                                 &cwd_for_hook,
                                 &hook_env,
@@ -2528,7 +2573,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                         let Some(handle) = guard.get_mut(&session_id) else {
                             return;
                         };
-                        handle.client = Arc::new(new_client);
+                        replace_worker_client(
+                            handle,
+                            new_client,
+                            &mut worker_generation,
+                            &next_worker_generation,
+                        );
                     }
 
                     info!(
@@ -3194,10 +3244,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let worker_generation = self
+            .next_worker_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let drain_task = self.start_drain_task(session_id.clone(), inbound, worker_generation);
         workers.insert(
             session_id.clone(),
             WorkerHandle {
+                generation: worker_generation,
                 client,
                 drain_task,
                 restart_history: vec![],
@@ -3318,6 +3372,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         lock_recover(&self.pending_resumes).contains_key(session_id)
     }
+    /// Whether a live event came from the worker currently installed for the
+    /// session. Queued frames from a replaced worker must not mutate runtime state.
+    pub(crate) async fn is_current_worker_generation(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|worker| worker.generation == generation)
+    }
 
     /// Return the number of running workers (for the doctor + stats).
     pub async fn count(&self) -> usize {
@@ -3330,9 +3397,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `begin_resume` and `is_running`, but no registry entry is written, so
     /// the reconciler's orphan sweep never touches it.
     #[cfg(test)]
-    pub(crate) async fn test_insert_worker(&self, session_id: &str) {
+    pub(crate) async fn test_insert_worker(&self, session_id: &str) -> u64 {
         let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
-        self.test_install_worker(session_id, client).await;
+        self.test_install_worker(session_id, client).await
     }
 
     /// Like `test_insert_worker`, but the fake worker's command loop records
@@ -3354,16 +3421,37 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `test_insert_worker*` fixtures so they differ only in which fake
     /// client they build.
     #[cfg(test)]
-    async fn test_install_worker(&self, session_id: &str, client: AcpClient) {
+    async fn test_install_worker(&self, session_id: &str, client: AcpClient) -> u64 {
+        let generation = self
+            .next_worker_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.workers.lock().await.insert(
             session_id.to_string(),
             WorkerHandle {
                 client: Arc::new(client),
                 drain_task: tokio::spawn(async {}),
+                generation,
                 restart_history: vec![],
                 kind: WorkerKind::Stdio,
             },
         );
+        generation
+    }
+
+    /// Replace a fixture's client as the automatic respawn path does.
+    #[cfg(test)]
+    pub(crate) async fn test_respawn_worker(&self, session_id: &str) -> u64 {
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
+        let mut workers = self.workers.lock().await;
+        let handle = workers.get_mut(session_id).expect("test worker");
+        let mut generation = handle.generation;
+        replace_worker_client(
+            handle,
+            client,
+            &mut generation,
+            &self.next_worker_generation,
+        );
+        generation
     }
 
     /// Drop a fake in-memory worker inserted by `test_insert_worker`, freeing
@@ -3634,6 +3722,10 @@ impl BroadcastSink for ChannelSink {
         let _ = self.publish_persisted(session_id, seq, event);
     }
 
+    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, generation: u64) {
+        self.publish_tagged(session_id, seq, event, Some(generation));
+    }
+
     fn clear_session_events(&self, session_id: &str) {
         self.event_store.delete_session(session_id);
         // The cached fold is a projection of the log we just deleted.
@@ -3641,6 +3733,53 @@ impl BroadcastSink for ChannelSink {
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
+        self.publish_tagged(session_id, seq, event, None)
+    }
+
+    fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        self.event_store.unresolved_approval_nonces(session_id)
+    }
+
+    fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        self.event_store.unresolved_elicitation_nonces(session_id)
+    }
+
+    fn record_attachment(
+        &self,
+        session_id: &str,
+        seq: u64,
+        blob: &crate::acp::event_store::AttachmentBlob,
+    ) -> bool {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
+                self.event_store.record_attachment(session_id, seq, blob)
+            }),
+            _ => self.event_store.record_attachment(session_id, seq, blob),
+        }
+    }
+
+    fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| {
+                    self.event_store.delete_attachments_for_seq(session_id, seq)
+                });
+            }
+            _ => self.event_store.delete_attachments_for_seq(session_id, seq),
+        }
+    }
+}
+
+impl ChannelSink {
+    /// Shared body of every `ChannelSink` publish. `worker_generation` is
+    /// `Some` only on the drain task's path.
+    fn publish_tagged(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        worker_generation: Option<u64>,
+    ) -> bool {
         // A rejection the agent attached no reset to inherits the reset of
         // the last rejection recorded for this session, as long as that
         // window has not rolled over yet. The worker's own capture dies with
@@ -3730,42 +3869,10 @@ impl BroadcastSink for ChannelSink {
             session_id: session_id.to_string(),
             seq,
             event: Arc::new(event_ref.clone()),
+            worker_generation,
         };
         let _ = self.tx.send(frame);
         persisted
-    }
-
-    fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
-        self.event_store.unresolved_approval_nonces(session_id)
-    }
-
-    fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
-        self.event_store.unresolved_elicitation_nonces(session_id)
-    }
-
-    fn record_attachment(
-        &self,
-        session_id: &str,
-        seq: u64,
-        blob: &crate::acp::event_store::AttachmentBlob,
-    ) -> bool {
-        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
-                self.event_store.record_attachment(session_id, seq, blob)
-            }),
-            _ => self.event_store.record_attachment(session_id, seq, blob),
-        }
-    }
-
-    fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
-        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-                tokio::task::block_in_place(|| {
-                    self.event_store.delete_attachments_for_seq(session_id, seq)
-                });
-            }
-            _ => self.event_store.delete_attachments_for_seq(session_id, seq),
-        }
     }
 }
 
@@ -3926,6 +4033,22 @@ mod tests {
         fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
             self.stale_elicitation_nonces.lock().unwrap().clone()
         }
+    }
+    #[tokio::test]
+    async fn respawned_worker_rejects_the_prior_generation() {
+        let sup = Supervisor::new(VecSink::new());
+        let first = sup.test_insert_worker("s-generation").await;
+        let second = sup.test_respawn_worker("s-generation").await;
+
+        assert_ne!(first, second);
+        assert!(
+            !sup.is_current_worker_generation("s-generation", first)
+                .await
+        );
+        assert!(
+            sup.is_current_worker_generation("s-generation", second)
+                .await
+        );
     }
 
     /// #3241: the allowlist gates both resolution branches, and a refusal is
@@ -4479,6 +4602,7 @@ cursor-acp-bridge = "agent acp"
         workers.insert(
             "s-1".into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: drain,
                 restart_history: vec![Instant::now()],
@@ -4529,6 +4653,10 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn resolve_mcp_layers_merges_native_global_and_profile() {
         let tmp = tempfile::TempDir::new().unwrap();
+        // Native discovery falls back to `CLAUDE_CONFIG_DIR`, so a developer
+        // running under a wrapper that exports it would read their own config
+        // instead of the temp HOME below.
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         // SAFETY: serialised by `#[serial]`; subsequent serial tests reassign
         // these env vars, which is the existing pattern in this module.
         unsafe {
@@ -4655,9 +4783,9 @@ cursor-acp-bridge = "agent acp"
         );
 
         // Trust the repo at the file's current fingerprint, then re-resolve.
-        let servers = crate::session::project_mcp::load_project_mcp_servers(&repo).unwrap();
-        let hash = crate::session::project_mcp::fingerprint(&servers);
-        crate::session::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
+        let servers = crate::session::mcp::project_mcp::load_project_mcp_servers(&repo).unwrap();
+        let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
+        crate::session::config::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
 
         let cwd = repo.clone();
         let merged = tokio::task::spawn_blocking(move || {
@@ -4750,6 +4878,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-1".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -4832,6 +4961,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-stop".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -4864,6 +4994,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-3401".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(AcpClient::fake_for_test_dead_connection(AcpSessionId(
                         "acp-3401".into(),
                     ))),
@@ -4950,6 +5081,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-reap".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5031,6 +5163,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-restart".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5100,6 +5233,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-stdio".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5166,6 +5300,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-stop".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5206,13 +5341,15 @@ cursor-acp-bridge = "agent acp"
         let sup = Supervisor::new(sink.clone());
 
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
-        let drain = sup.start_drain_task("s-rl".into(), inbound_rx);
+        let worker_generation = 1;
+        let drain = sup.start_drain_task("s-rl".into(), inbound_rx, worker_generation);
         {
             let mut workers = sup.workers.lock().await;
             let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId("s-rl".into()));
             workers.insert(
                 "s-rl".into(),
                 WorkerHandle {
+                    generation: worker_generation,
                     client: Arc::new(client),
                     // Drain task installed above owns the only handle we
                     // care about; this field is just a placeholder so
@@ -5274,6 +5411,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-stdio".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5299,6 +5437,7 @@ cursor-acp-bridge = "agent acp"
         workers.insert(
             session_id.into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: drain,
                 restart_history: vec![],
@@ -5448,6 +5587,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 session.into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: tokio::spawn(async {}),
                     restart_history: vec![],
@@ -5766,6 +5906,7 @@ cursor-acp-bridge = "agent acp"
         sup.workers.lock().await.insert(
             "s-reset".into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
@@ -5818,6 +5959,7 @@ cursor-acp-bridge = "agent acp"
         sup.workers.lock().await.insert(
             "s-reset-busy".into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
@@ -6473,8 +6615,8 @@ cursor-acp-bridge = "agent acp"
         let sup = Supervisor::new(sink.clone());
         let resets_at = chrono::Utc::now();
 
-        let seq1 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
-        let seq2 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
+        let seq1 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at, false);
+        let seq2 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at, false);
         assert_eq!(seq1, 1);
         assert_eq!(seq2, 2, "seq must be monotonic per session");
 
@@ -6485,7 +6627,7 @@ cursor-acp-bridge = "agent acp"
             .expect("first breadcrumb frame published");
         assert!(matches!(
             &first.2,
-            Event::RateLimitAutoResumed { resets_at: ts } if *ts == resets_at
+            Event::RateLimitAutoResumed { resets_at: ts, .. } if *ts == resets_at
         ));
     }
 
@@ -6513,6 +6655,7 @@ cursor-acp-bridge = "agent acp"
         workers.insert(
             "s-1".into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: drain,
                 restart_history: vec![],

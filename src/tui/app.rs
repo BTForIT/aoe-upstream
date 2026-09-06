@@ -1854,6 +1854,17 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            let store_move = self.home.poll_store_move();
+            if store_move.changed {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            if let Some(action) = store_move.resume {
+                self.execute_action(action, terminal)?;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 // A structured session routes the post-create attach into
@@ -2177,7 +2188,12 @@ impl App {
         if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
             self.update_status = None;
         }
-        let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        let store_move_line = self.home.store_move_status_line();
+        let status_text = self
+            .update_status
+            .as_ref()
+            .map(|s| s.text.as_str())
+            .or(store_move_line.as_deref());
         // Only hand the renderer the image banner when it's actually the active
         // one; while a pull is in flight `image_banner_active` is false, so the
         // banner can't re-render under the "pulling…" toast and clobber itself
@@ -3326,7 +3342,7 @@ impl App {
             now,
             &attached,
             |profile| {
-                crate::session::profile_config::resolve_config_or_warn(profile)
+                crate::session::config::profile_config::resolve_config_or_warn(profile)
                     .session
                     .auto_stop_idle_secs
             },
@@ -3536,11 +3552,11 @@ impl App {
         Ok(())
     }
 
-    /// Route a freshly-created session through the user's
-    /// `default_attach_mode` setting. Shared by both creation paths
-    /// (synchronous `Action::AttachAfterCreate` and the async branch in
-    /// the main loop's `apply_creation_results` handler) so the setting
-    /// applies regardless of which one fired.
+    /// Route a freshly-created session through the configured new-session
+    /// mode. Shared by both creation paths (synchronous
+    /// `Action::AttachAfterCreate` and the async branch in the main loop's
+    /// `apply_creation_results` handler) so the mode applies regardless of
+    /// which one fired.
     ///
     /// A structured session skips the tmux modes entirely and opens its
     /// structured view (#2926): the wizard's Structured toggle is an
@@ -3562,7 +3578,7 @@ impl App {
             self.pending_structured_view_open = Some(session_id.to_string());
             return Ok(());
         }
-        let mode = self.home.default_attach_mode(session_id);
+        let mode = self.home.new_session_attach_mode(session_id);
         tracing::debug!(target: "tui.input",
             session_id = %session_id,
             mode = ?mode,
@@ -3677,6 +3693,13 @@ impl App {
                 }
             }
 
+            if instance.is_sandboxed()
+                && self
+                    .defer_to_store_move(session_id, Action::AttachSession(session_id.to_string()))
+            {
+                return Ok(());
+            }
+
             // Get terminal size to pass to tmux session creation
             // This ensures the session starts at the correct size instead of 80x24 default
             let size = crate::terminal::get_size();
@@ -3771,6 +3794,22 @@ impl App {
         Ok(())
     }
 
+    /// If launching `session_id` would first copy its sandbox store, start
+    /// that copy on the worker and come back to `resume` once it is done,
+    /// returning `true`. The copy can take minutes; the status line narrates
+    /// it meanwhile.
+    fn defer_to_store_move(&mut self, session_id: &str, resume: Action) -> bool {
+        if !self.home.needs_store_move_before_launch(session_id) {
+            return false;
+        }
+        if !self.home.begin_store_move(session_id, Some(resume)) {
+            self.update_status = Some(UpdateStatus::transient(
+                "another agent store move is still in progress".into(),
+            ));
+        }
+        true
+    }
+
     fn attach_terminal(
         &mut self,
         session_id: &str,
@@ -3790,6 +3829,12 @@ impl App {
             TerminalMode::Container if instance.is_sandboxed() => {
                 let container_session = instance.container_terminal_tmux_session()?;
                 if !container_session.exists() || container_session.is_pane_dead() {
+                    if self.defer_to_store_move(
+                        session_id,
+                        Action::AttachTerminal(session_id.to_string(), mode),
+                    ) {
+                        return Ok(());
+                    }
                     if container_session.exists() {
                         let _ = container_session.kill();
                     }
@@ -4143,13 +4188,10 @@ pub enum Action {
     /// "Reviving..." toast before `ensure_pane_ready` runs, then the home
     /// view flips into the live-send capture state for subsequent keys.
     EnterLiveSend(String),
-    /// Attach to a session that was just created via the synchronous
-    /// create path (no sandbox, no hooks, no worktree). Routes through
-    /// the same `default_attach_mode` dispatch as the async path's
-    /// `apply_creation_results` so the user's "live mode by default"
-    /// setting applies in both cases. `AttachSession` deliberately
-    /// bypasses the setting because pressing Enter on a session row is
-    /// the user's explicit ask for a tmux attach.
+    /// Open a session that was just created via the synchronous create path
+    /// (no sandbox, hooks, or worktree). This action routes through the
+    /// new-session mode, like the async path in `apply_creation_results`.
+    /// `AttachSession` is already resolved for an existing session row.
     AttachAfterCreate(String),
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.

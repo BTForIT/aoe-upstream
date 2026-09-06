@@ -4,7 +4,7 @@
 // locale, and proxy settings. Anything inherited that names a config, data,
 // or credential location escapes the temporary HOME, because the daemon
 // resolves agent state from its own environment (`resolve_agent_home` in
-// `src/session/capture.rs`, the opencode readers, the XDG bases). A developer
+// `src/session/capture/mod.rs`, the opencode readers, the XDG bases). A developer
 // or CI shell exporting one of them points a live spec at real agent state.
 //
 // Listing every such name does not hold on its own: `src/` reads more than a
@@ -59,6 +59,9 @@ export const HOST_STATE_VARS = new Set([
   "AOE_ACP_AGENT_ENV", // the daemon -> runner env carrier, decoded into agents
   "AOE_ACP_NODE", // an arbitrary host Node executable for the ACP runner
   "AOE_CITYHALL_MODE", // serves the daemon as a client of a host CityHall
+  // Defers the sandbox store migration; a host shell exporting it would make
+  // every live spec skip v027 and run against the pre-migration layout.
+  "AOE_DEFER_SANDBOX_MIGRATION",
   // `apply_cityhall_bundle` runs on the boot path: a host URL is fetched and
   // applied as config, and a first boot that cannot reach it aborts the
   // daemon outright.
