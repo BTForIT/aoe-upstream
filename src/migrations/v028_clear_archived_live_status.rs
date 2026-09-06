@@ -29,11 +29,14 @@ use std::fs;
 use std::path::Path;
 use tracing::{debug, info};
 
+/// Migration entry point: settle archived live statuses under the app dir.
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     run_in(&app_dir)
 }
 
+/// Walk every profile's `sessions.json` plus the legacy top-level one under
+/// `app_dir`. Split from `run` so tests can point it at a temp dir.
 pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
     let profiles_dir = app_dir.join("profiles");
     if profiles_dir.exists() {

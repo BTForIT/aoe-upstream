@@ -107,9 +107,12 @@ impl Instance {
     }
 
     /// Idle is the resting state an archived row can truthfully claim; see
-    /// `archive`. Shared with the status poller's archived short-circuit so a
-    /// row frozen by an older build (or merged in from a peer) heals in
-    /// memory without waiting for the one-shot v028 migration.
+    /// `archive`. Shared with the status poller's archived short-circuit (so
+    /// a row frozen by an older build heals in memory without waiting for the
+    /// one-shot v028 migration) and with the three disk-write merges that can
+    /// land a status or an archive on a row (`merge_user_action_diff`,
+    /// `merge_passive_status_patch`, `merge_from_tui`), so a stale
+    /// pre-archive observation cannot re-freeze it.
     pub(crate) fn settle_archived_status(&mut self) {
         if matches!(
             self.status,
