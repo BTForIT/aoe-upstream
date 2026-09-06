@@ -70,15 +70,21 @@ pub async fn resolve_option_source(
     match source {
         OptionSource::AcpAgents => Ok(acp_agent_options(&state.profile).await),
         OptionSource::AcpModels => {
-            // If the resolved profile pins a model for the selected agent, the
-            // picker collapses to that single model: a pinned agent always
-            // spawns on its pinned model, so listing the agent's full advertised
-            // catalog would let the user pick a model the spawn silently
-            // overrides. Post-create escalation stays available via
-            // `aoe session set-model`.
+            // When the resolved profile pins the selected agent's model
+            // (`acp.acp_defaults.<agent>.pin_model`), the picker collapses to
+            // that one entry. Enforcement lives at creation (`sessions.create`
+            // refuses any other model; the spawn resolver applies the pin on
+            // every path), so this is presentation only: the wizard must not
+            // offer choices the create call will refuse. The catalog supplies
+            // the display label when it knows the pinned model.
             if let Some(agent) = depends.first().filter(|a| !a.is_empty()) {
                 if let Some(model) = pinned_model_for_agent(&state.profile, agent).await {
-                    return Ok(vec![SelectOption::new(&model, &model)]);
+                    let label = catalog_options(Some(agent), CatalogCategory::Model)
+                        .into_iter()
+                        .find(|opt| opt.value == model)
+                        .map(|opt| opt.label)
+                        .unwrap_or_else(|| model.clone());
+                    return Ok(vec![SelectOption::new(&model, &label)]);
                 }
             }
             Ok(catalog_options_probing(depends.first(), CatalogCategory::Model).await)
@@ -251,52 +257,18 @@ async fn group_options(state: &Arc<AppState>) -> Vec<SelectOption> {
     paths.iter().map(|p| SelectOption::new(p, p)).collect()
 }
 
-/// Extract the value of a `--model` / `-m` flag from a whitespace-split
-/// extra-args string (`session.agent_extra_args.<agent>`). Handles the spaced
-/// form (`--model X`, `-m X`) and the joined form (`--model=X`, `-m=X`). A
-/// dangling flag — no following value, or the next token is another option
-/// (`--model --verbose`) — yields `None` rather than a bogus model.
-fn parse_model_flag(args: &str) -> Option<String> {
-    let toks: Vec<&str> = args.split_whitespace().collect();
-    for (i, tok) in toks.iter().enumerate() {
-        if let Some(v) = tok
-            .strip_prefix("--model=")
-            .or_else(|| tok.strip_prefix("-m="))
-        {
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        } else if *tok == "--model" || *tok == "-m" {
-            if let Some(v) = toks
-                .get(i + 1)
-                .filter(|v| !v.is_empty() && !v.starts_with('-'))
-            {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// The model pinned for `agent` in the resolved profile config, if any: an
-/// explicit `acp_defaults.<agent>.model` wins, otherwise a `--model` / `-m`
-/// token parsed from `session.agent_extra_args.<agent>`. When a pin exists the
-/// model picker collapses to it: a pinned agent always spawns on that model, so
-/// offering others in the wizard is a lie (pick one, get the pin). Post-create
-/// escalation stays available via `aoe session set-model`.
+/// The model pinned for `agent` in the resolved profile config, if any
+/// (`acp.acp_defaults.<agent>.pin_model = true` with a `model`). A plain
+/// `model` without the flag is a default, not a pin, and yields `None`: an
+/// explicit request still wins over a default at creation, so the picker must
+/// keep offering the full catalog for it.
 async fn pinned_model_for_agent(profile: &str, agent: &str) -> Option<String> {
     let profile = profile.to_string();
     let agent = agent.to_string();
     tokio::task::spawn_blocking(move || {
-        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-        if let Some(model) = config.acp.acp_defaults_for(&agent).and_then(|d| d.model()) {
-            return Some(model);
-        }
-        config
-            .session
-            .agent_extra_args
-            .get(&agent)
-            .and_then(|args| parse_model_flag(args))
+        crate::session::config::profile_config::resolve_config_or_warn(&profile)
+            .acp
+            .pinned_model_for(&agent)
     })
     .await
     .ok()
@@ -375,40 +347,29 @@ mod tests {
         assert!(picked.iter().any(|o| &o.value == name));
     }
 
-    #[test]
-    fn parse_model_flag_extracts_the_pinned_model() {
-        // spaced form, both flag spellings
+    /// The picker collapses only on an explicit pin. A plain
+    /// `acp_defaults.<agent>.model` is a default (an explicit request still
+    /// wins at `sessions.create`), so it must keep the full catalog.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn picker_collapses_on_a_pin_but_not_on_a_default() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let config_path = crate::session::get_app_dir()
+            .expect("isolated app dir")
+            .join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[acp.acp_defaults.opencode]\nmodel = \"openai/gpt-5.5\"\n\n\
+             [acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
+        )
+        .expect("write config");
+
+        assert_eq!(pinned_model_for_agent("default", "opencode").await, None);
         assert_eq!(
-            parse_model_flag("--model claude-opus-4-8"),
-            Some("claude-opus-4-8".to_string())
+            pinned_model_for_agent("default", "claude").await.as_deref(),
+            Some("claude-pinned")
         );
-        assert_eq!(
-            parse_model_flag("-m gpt-5.6-sol"),
-            Some("gpt-5.6-sol".to_string())
-        );
-        // joined form
-        assert_eq!(
-            parse_model_flag("--model=claude-fable-5"),
-            Some("claude-fable-5".to_string())
-        );
-        assert_eq!(
-            parse_model_flag("-m=claude-opus-4-8"),
-            Some("claude-opus-4-8".to_string())
-        );
-        // the flag surrounded by other args (real profile shape)
-        assert_eq!(
-            parse_model_flag("--port 8080 --model claude-opus-4-8 --verbose"),
-            Some("claude-opus-4-8".to_string())
-        );
-        // no model flag present -> no pin
-        assert_eq!(parse_model_flag("--port 8080"), None);
-        assert_eq!(parse_model_flag(""), None);
-        // a flag followed by another option is dangling, not a pin on "--verbose"
-        assert_eq!(parse_model_flag("--model --verbose"), None);
-        assert_eq!(parse_model_flag("-m -v --port 8080"), None);
-        assert_eq!(parse_model_flag("--port 8080 --model"), None);
-        // dangling flag with no value -> no pin (never returns an empty model)
-        assert_eq!(parse_model_flag("--model"), None);
-        assert_eq!(parse_model_flag("foo --model="), None);
+        assert_eq!(pinned_model_for_agent("default", "gemini").await, None);
     }
 }
