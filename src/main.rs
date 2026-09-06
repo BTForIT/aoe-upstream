@@ -383,6 +383,7 @@ async fn run(
         Some(Commands::Skill { command }) => return cli::skill::run(command),
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
+        Some(Commands::Migrate) => return cli::migrate::run(),
         // Pure redirect; needs no app data, so it must short-circuit before
         // config/migration prework that can fail in constrained environments.
         Some(Commands::Stop { .. }) => return cli::killall::stop_trap(),
@@ -392,9 +393,19 @@ async fn run(
     let profile_explicit = cli.profile.is_some();
     let profile = cli.profile.unwrap_or_default();
 
-    // TUI mode handles migrations with a spinner; CLI runs them silently
+    // TUI mode handles migrations with a spinner. CLI commands report progress
+    // on stderr only when a migration actually does work, so a quick command
+    // stays quiet and a long store move never looks like a hang.
+    // Hidden machine-spawned subcommands get no reporter, so nothing lands in
+    // a detached worker's redirected stderr; see the `command_name` gate below.
     if cli.command.is_some() {
-        migrations::run_migrations()?;
+        let reporter = cli
+            .command
+            .as_ref()
+            .and_then(cli::command_name)
+            .is_some()
+            .then(cli::migrate::stderr_reporter);
+        migrations::run_migrations_with(reporter)?;
     }
 
     // Process-wide poller budget: the daemon and every TUI each run their own

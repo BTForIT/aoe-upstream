@@ -128,8 +128,9 @@ pub fn set_favorites_first(on: bool) {
 
 pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
-    save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
-    validate_network_format, validate_port_mapping_format, validate_volume_format, ProfileConfig,
+    save_profile_config, validate_capability_format, validate_check_interval, validate_env_format,
+    validate_memory_limit, validate_network_format, validate_port_mapping_format,
+    validate_security_opt_format, validate_volume_format, ProfileConfig,
 };
 pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
@@ -142,8 +143,8 @@ pub use recovery::HookTimeoutScope;
 pub use scope::SessionScope;
 pub(crate) use storage::{
     acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
-    read_file_no_follow, replace_file_no_follow, resolve_symlink_chain, GroupMovePlan,
-    StorageFlock, STORAGE_LOCK_FILENAME,
+    read_file_no_follow, replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock,
+    GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

@@ -82,6 +82,34 @@ impl Instance {
         environment
     }
 
+    /// Whether this session still reads the shared sandbox store, so its next
+    /// container launch first copies that store; see [`Self::move_sandbox_store`].
+    pub fn sandbox_store_move_pending(&self) -> bool {
+        self.is_sandboxed()
+            && self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
+    }
+
+    /// Move this session's sandbox store into the private layout, narrating
+    /// the copy to `reporter`. `Ok(false)` means the container is up, so the
+    /// store cannot move yet and nothing was attempted. The row is read back
+    /// from disk by the caller, not here: the TUI's copy lives in its own
+    /// mirror.
+    ///
+    /// A running container is worth skipping outright: its cohort cannot
+    /// move while it is up, so the pass is guaranteed to refuse, and it is
+    /// not free, since planning takes the v027 lock and every registry's
+    /// storage lock, on which `Storage::update` waits.
+    pub fn move_sandbox_store(
+        &self,
+        reporter: Option<crate::migrations::progress::Reporter>,
+    ) -> Result<bool> {
+        if DockerContainer::from_session_id(&self.id).is_running()? {
+            return Ok(false);
+        }
+        crate::migrations::migrate_sandbox_store_for_with(&self.id, reporter)?;
+        Ok(true)
+    }
+
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
         let detect_as = self.effective_detect_as().into_owned();
         let image = self
@@ -91,6 +119,25 @@ impl Instance {
             .image
             .clone();
         let container = DockerContainer::new(&self.id, &image);
+        // Charge the sandbox store move to the session that needs it, at the
+        // one chokepoint every entry point shares: tmux launches, ACP
+        // structured sessions and a bare container terminal all arrive here.
+        // The TUI runs it ahead of time on a worker so this is a no-op there;
+        // see `tui::store_move_poller`. It must stay above the shared flock
+        // below, which the move takes exclusively to plan and publish. A
+        // failure leaves the row on its shared store for a later attempt
+        // rather than blocking the launch.
+        if self.sandbox_store_move_pending() {
+            match self.move_sandbox_store(Some(crate::migrations::progress::tracing_reporter())) {
+                Ok(true) => self.reconcile_from_disk(),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    session_id = %self.id,
+                    %error,
+                    "sandbox store move deferred; session continues on its shared store"
+                ),
+            }
+        }
         let _transition_lock =
             if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
                 Some(crate::session::acquire_storage_shared_flock(
@@ -147,7 +194,7 @@ impl Instance {
 
         if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
             anyhow::bail!(
-                "sandbox store transition is pending for {}; stop all legacy sandbox peers and restart AoE before relaunching it",
+                "sandbox store transition is pending for {}; stop the other sandboxed sessions sharing this agent's store, then relaunch it or run `aoe migrate`",
                 self.id
             );
         }
@@ -192,6 +239,16 @@ impl Instance {
         // carries the values (leak-safe via the inherit path in run_create).
         self.ensure_before_start_env(true)?;
         let config = self.build_container_config()?;
+        // Still the workdir the *previous* container was created with; the pin below
+        // is what moves it forward.
+        let stranded = container_config::stranded_named_ignore_volumes(
+            &config,
+            &self.id,
+            self.sandbox_info
+                .as_ref()
+                .and_then(|sandbox| sandbox.container_workdir.as_deref()),
+        );
+        container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         let container_id = container.create(&config)?;
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)

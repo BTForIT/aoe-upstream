@@ -8,6 +8,7 @@
 //! 2. Implement the migration function
 //! 3. Add it to the `MIGRATIONS` array below
 
+pub mod progress;
 mod v001_xdg_linux;
 mod v002_seed_sandbox_from_volumes;
 mod v003_yolo_mode_config;
@@ -200,8 +201,64 @@ pub fn has_pending_migrations() -> bool {
     get_current_version() < CURRENT_VERSION
 }
 
-/// Run all pending migrations. Call this early in app startup.
+/// Move this session's sandbox store into the private layout, if it is still
+/// on the shared one. Called from the container path so the copy is paid by
+/// the session that needs it rather than by every pending row on any `aoe`
+/// start.
+///
+/// `reporter` is how a caller with a screen narrates the copy: the TUI
+/// forwards it to its status line from a worker thread. Callers without one
+/// pass [`progress::tracing_reporter`], which leaves a trail in the log.
+///
+/// A failure here is reported by the caller and does not block the launch:
+/// a row that did not move stays on its shared store and is retried.
+pub fn migrate_sandbox_store_for_with(
+    id: &str,
+    reporter: Option<progress::Reporter>,
+) -> Result<()> {
+    if get_current_version() < 27 {
+        return Ok(());
+    }
+    let _installed = progress::install(reporter);
+    v027_isolate_sandbox_stores::migrate_instance(id)
+}
+
+/// [`migrate_sandbox_store_for_with`] with the container probes injected, for
+/// a test that drives the launch-time move with no container runtime.
+#[cfg(test)]
+pub(crate) fn migrate_sandbox_store_for_test(
+    id: &str,
+    reporter: Option<progress::Reporter>,
+    is_running: &dyn Fn(&str) -> Result<bool>,
+    reap: &dyn Fn(&str) -> Result<bool>,
+) -> Result<()> {
+    let _installed = progress::install(reporter);
+    v027_isolate_sandbox_stores::migrate_instance_with(id, is_running, reap)
+}
+
 pub fn run_migrations() -> Result<()> {
+    run_migrations_with(None)
+}
+
+/// Run all pending migrations, sending [`progress::Event`]s to `reporter` so a
+/// long one (store copies, container probes) reads as work, not a hang.
+///
+/// A still-pending sandbox store move is *not* retried here: v027's rows move
+/// when their session next needs a container, or all at once under
+/// [`run_migrations_announced`] for `aoe migrate`. This path only advances the
+/// schema version and reports the migrations it actually runs.
+pub fn run_migrations_with(reporter: Option<progress::Reporter>) -> Result<()> {
+    run_migrations_inner(reporter, false)
+}
+
+/// [`run_migrations_with`] for an explicit `aoe migrate`: a pending sandbox
+/// store move also narrates what is still pending and why.
+pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<()> {
+    run_migrations_inner(reporter, true)
+}
+
+fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) -> Result<()> {
+    let _installed = progress::install(reporter);
     let current = get_current_version();
     debug!("Current schema version: {}", current);
 
@@ -211,28 +268,40 @@ pub fn run_migrations() -> Result<()> {
         );
     }
     if current == CURRENT_VERSION {
-        return v027_isolate_sandbox_stores::reconcile_pending();
+        return v027_isolate_sandbox_stores::reconcile_pending(announce);
     }
 
-    for migration in MIGRATIONS {
-        if migration.version > current {
-            let start = std::time::Instant::now();
-            info!(
-                target: "migrations",
-                version = migration.version,
-                name = migration.name,
-                "running migration"
-            );
-            (migration.run)()?;
-            set_version(migration.version)?;
-            info!(
-                target: "migrations",
-                version = migration.version,
-                name = migration.name,
-                duration_ms = start.elapsed().as_millis() as u64,
-                "migration completed"
-            );
-        }
+    let pending: Vec<&Migration> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > current)
+        .collect();
+    for (index, migration) in pending.iter().enumerate() {
+        let start = std::time::Instant::now();
+        info!(
+            target: "migrations",
+            version = migration.version,
+            name = migration.name,
+            "running migration"
+        );
+        progress::report(progress::Event::Started {
+            version: migration.version,
+            name: migration.name,
+            position: index + 1,
+            total: pending.len(),
+        });
+        (migration.run)()?;
+        set_version(migration.version)?;
+        progress::report(progress::Event::Finished {
+            version: migration.version,
+            elapsed: start.elapsed(),
+        });
+        info!(
+            target: "migrations",
+            version = migration.version,
+            name = migration.name,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "migration completed"
+        );
     }
 
     Ok(())

@@ -83,6 +83,25 @@ pub fn docker_env_args(entries: &[EnvEntry]) -> (Vec<String>, Vec<(String, Strin
     (argv, inherit)
 }
 
+/// A Docker-style `run` flag supported by a container runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFlag {
+    Privileged,
+    CapAdd,
+    CapDrop,
+    SecurityOpt,
+}
+
+/// Container run-policy flags mapped from `[sandbox]` settings.
+#[derive(Debug, Default, Clone)]
+pub struct RunPolicy {
+    pub privileged: bool,
+    pub cap_add: Vec<String>,
+    pub cap_drop: Vec<String>,
+    pub security_opt: Vec<String>,
+    pub extra_run_args: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct ContainerConfig {
     pub working_dir: String,
@@ -90,6 +109,14 @@ pub struct ContainerConfig {
     pub anonymous_volumes: Vec<String>,
     /// Named volumes for volume_ignores when strategy = "named". Cleaned up explicitly on session delete.
     pub named_ignore_volumes: Vec<NamedVolumeMount>,
+    /// Whether these paths, `working_dir` included, follow from the project's real
+    /// layout rather than from the collapsed fallback a failed `find_main_repo` takes.
+    ///
+    /// Gates the volume reclaim in `stranded_named_ignore_volumes`, which reads a
+    /// changed `working_dir` as a move; under the fallback that change may be nothing
+    /// but the failure. Defaults to false, so a config that has not positively
+    /// established its paths never drives a deletion.
+    pub named_ignore_volumes_authoritative: bool,
     pub environment: Vec<EnvEntry>,
     pub cpu_limit: Option<String>,
     pub memory_limit: Option<String>,
@@ -104,6 +131,7 @@ pub struct ContainerConfig {
     pub selinux_relabel: bool,
     /// Runtime-only evidence that this config installed an identity publisher.
     pub identity_publisher_installed: bool,
+    pub run_policy: RunPolicy,
 }
 
 impl ContainerConfig {
