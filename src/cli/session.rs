@@ -653,7 +653,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
     let mut being_restored_elsewhere = 0usize;
     let mut being_purged_elsewhere = 0usize;
     for inst in &trashed {
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&inst.project_path),
         );
@@ -762,7 +762,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
 }
 
 async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
-    let config = crate::session::profile_config::resolve_config(profile)?;
+    let config = crate::session::config::profile_config::resolve_config(profile)?;
 
     // `--minutes` overrides the profile default; otherwise use the
     // configured `snooze_duration_minutes`. Validate either way so the
@@ -1503,6 +1503,16 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
+fn supervise_attach_capture(
+    inst: &mut Instance,
+    attach: impl FnOnce(&Instance) -> Result<()>,
+) -> Result<()> {
+    inst.maybe_start_poller();
+    let result = attach(inst);
+    inst.stop_and_flush_poller();
+    result
+}
+
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
@@ -1518,8 +1528,9 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         );
     }
 
-    tmux_session.attach()?;
-    Ok(())
+    let mut working = inst.clone();
+    working.source_profile = profile.to_string();
+    supervise_attach_capture(&mut working, |_| tmux_session.attach())
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
@@ -1551,7 +1562,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     // Resolving the profile config installs the declarative status-rule
     // registry for this profile; the status detection below never loads config
     // itself, so a rules-having custom agent would otherwise report Idle.
-    crate::session::profile_config::resolve_config_or_warn(profile);
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
 
     // Refresh status from tmux so the output reflects current state
     // rather than the stale persisted value.
@@ -1615,7 +1626,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
     // Resolving the profile config installs the declarative status-rule
     // registry for this profile; the status detection below never loads config
     // itself, so a rules-having custom agent would otherwise report Idle.
-    crate::session::profile_config::resolve_config_or_warn(profile);
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
 
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
@@ -1804,7 +1815,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // Tied mode (#1927): renaming an aoe-managed worktree session also moves
     // its directory leaf to match the title (and optionally the branch), so
     // the two cannot drift. Decided per-session from the resolved setting.
-    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
     let tied_edit = tied && (args.title.is_some() || args.rename_branch);
     let duplicate_path = if tied_edit {
@@ -2186,7 +2197,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     // When tied (#1927) the directory follows the title, so reject the
     // standalone edit and point at the unified rename instead.
     if inst.tie_workdir_applies(
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::config::profile_config::resolve_config_or_warn(profile)
             .session
             .tie_workdir_to_name,
     ) {
@@ -2374,13 +2385,9 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         crate::session::ResumeIntent::Use(id) => {
             println!("✓ Set resume target for '{}': {}", title, id);
             if let Some(agent) = crate::agents::get_agent(&tool) {
-                if matches!(
-                    agent.resume_strategy,
-                    crate::agents::ResumeStrategy::Unsupported
-                ) {
+                if agent.session_support.is_none() {
                     eprintln!(
-                        "Warning: session resume is disabled for {} in AoE; this ID will be stored but not used.",
-                        tool
+                        "Warning: {tool} does not support exact native session resume; this ID will be stored but not used."
                     );
                 }
             }
@@ -2635,13 +2642,67 @@ fn resolve_base_target(inst: &crate::session::Instance, repo: Option<&str>) -> R
 
 #[cfg(test)]
 mod restart_args_tests {
-    use super::SessionCommands;
+    use super::{supervise_attach_capture, SessionCommands};
     use clap::Parser;
 
     #[derive(Parser)]
     struct Cli {
         #[command(subcommand)]
         cmd: SessionCommands,
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_supervision_starts_before_attach_and_flushes_every_return() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "attach-capture-supervision";
+        let mut inst = crate::session::Instance::new("attach", "/tmp/attach");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some("d38740e4-bd1f-43d7-8727-485652e4678e".to_string());
+        inst.mark_pi_extension_launched_for_test();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _| {
+                *instances = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+
+        let first = "01a053b6-c470-78de-9d8f-bc00ef05332a";
+        supervise_attach_capture(&mut inst, |live| {
+            assert!(
+                live.session_id_poller_is_running(),
+                "capture must be supervised before the blocking attach call"
+            );
+            crate::hooks::write_session_id_via_guard(&live.id, first).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(inst.session_id_poller.is_none());
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(first)
+        );
+
+        let second = "01a053b6-c470-78de-9d8f-bc00ef05332b";
+        let result = supervise_attach_capture(&mut inst, |live| {
+            crate::hooks::write_session_id_via_guard(&live.id, second).unwrap();
+            Err(anyhow::anyhow!("fake attach failure"))
+        });
+
+        assert_eq!(result.unwrap_err().to_string(), "fake attach failure");
+        assert!(
+            inst.session_id_poller.is_none(),
+            "an immediate nested attach return must not orphan its poller"
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(second),
+            "the final /new identity must be durable even when attach returns an error"
+        );
     }
 
     #[test]

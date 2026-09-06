@@ -35,7 +35,7 @@ import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
-import { loadScrollState, saveScrollState } from "../../lib/acpScrollState";
+import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
@@ -373,12 +373,11 @@ function AcpChrome({
     respawn: resumeRateLimitedSession,
   } = useRespawnSession(sessionId, state.rateLimit ? (state.rateLimit.resets_at ?? "unknown") : null);
 
-  // Re-pin the chat viewport to the bottom when the composer (or any
-  // sibling below it: queued strip, primer banner) grows. assistant-ui's
-  // `autoScroll` only re-pins on message updates, not on viewport
-  // height shrinks; without this, typing multi-line prompts slides the
-  // visible bottom of the chat up by the height the composer just
-  // grew. See #1104.
+  // Re-pin the chat viewport when its content or the chrome below it grows.
+  // These observers own the stick-to-bottom contract; the primitive's separate
+  // auto-scroll state is disabled below so it cannot override a reader who has
+  // scrolled up. Without the viewport resize observer, typing multi-line prompts
+  // slides the visible bottom up by the composer's growth. See #1104.
   //
   // We sample "is the viewport pinned to the bottom?" on every scroll
   // event into a ref. By the time the ResizeObserver fires the layout
@@ -491,10 +490,8 @@ function AcpChrome({
     const below = belowViewportRef.current;
     const content = messagesContentRef.current;
     if (!vp || !below) return;
-    // Treat "within 16px of the bottom" as pinned. assistant-ui's
-    // own stick-to-bottom uses a similar slop; sub-pixel rounding
-    // and momentary content reflows otherwise drop us out of the
-    // pinned state for one frame.
+    // Treat "within 16px of the bottom" as pinned. Sub-pixel rounding and
+    // momentary content reflows otherwise drop the pinned state for one frame.
     // Stick-to-bottom intent (`wasAtBottomRef`) must change ONLY on a real user
     // scroll gesture. On a coarse-pointer device the browser also fires "scroll"
     // for programmatic scrolls and, critically, for the interim scroll it emits
@@ -585,14 +582,13 @@ function AcpChrome({
       if (stick) lastAtBottomAtRef.current = performance.now();
       setAtBottom(stick);
       const applyStart = () => {
-        if (stick) {
-          vp.scrollTop = vp.scrollHeight;
-        } else if (saved) {
-          vp.scrollTop = Math.max(0, Math.min(saved.top, vp.scrollHeight - vp.clientHeight));
-        }
+        const top = restoredScrollTop(saved, wasAtBottomRef.current, vp.scrollHeight, vp.clientHeight);
+        if (top != null) vp.scrollTop = top;
       };
-      // After the cached transcript lays out; a second pass for the stick case
-      // catches content (markdown, tool cards, images) that renders a beat later.
+      // Pin the rendered transcript before paint. Later passes catch markdown,
+      // tool cards, and images that lay out afterward, but applyStart rechecks
+      // current stick intent so an intervening user scroll wins.
+      applyStart();
       requestAnimationFrame(() => requestAnimationFrame(applyStart));
       if (stick) window.setTimeout(applyStart, 150);
     }
@@ -624,9 +620,9 @@ function AcpChrome({
     //   - Otherwise it grew at the BOTTOM (a streaming turn, a new message):
     //     keep the view pinned to the bottom if the user was already there, so
     //     the latest output follows without them chasing it. If they scrolled
-    //     up, leave their position alone. This is our own stick-to-bottom;
-    //     assistant-ui's `autoScroll` is a belt-and-suspenders backstop that
-    //     was under-sticking during fast streams, which is why this exists.
+    //     up, leave their position alone. This observer is the authoritative
+    //     bottom-following path; the viewport primitive's competing auto-scroll
+    //     intent is disabled below.
     const contentRo = new ResizeObserver(() => {
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
@@ -666,9 +662,8 @@ function AcpChrome({
   const chromeTransitionInitRef = useRef(true);
   useEffect(() => {
     // Skip the initial mount: only actual open/close transitions should pin.
-    // The first paint's scroll-to-bottom is handled by autoScroll + the content
-    // observer, and pinning here on mount would fight a user scrolling up right
-    // after the view appears.
+    // The first paint is handled by the content observer and scroll-state
+    // restore; pinning here would fight a user scrolling up immediately.
     if (chromeTransitionInitRef.current) {
       chromeTransitionInitRef.current = false;
       return;
@@ -718,11 +713,12 @@ function AcpChrome({
         onPrefill={recoveryHandoffPrefill}
       >
         {({ onSwitchAgent }) =>
-          status !== "open" || state.lagged || state.rateLimit || reconnecting ? (
+          status !== "open" || state.lagged || state.rateLimit || state.rateLimitRetriesExhausted || reconnecting ? (
             <SystemNotices
               status={status}
               lagged={state.lagged}
               rateLimit={state.rateLimit}
+              rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
               hasEverOpened={hasEverOpened}
               reconnecting={reconnecting}
               retryCount={retryCount}
@@ -789,10 +785,10 @@ function AcpChrome({
             the bottom of the scroll area, just above the composer. */}
         <div className="relative flex min-h-0 flex-1 flex-col">
           <ThreadPrimitive.Viewport
-            autoScroll
+            autoScroll={false}
             ref={viewportRef}
             data-testid="acp-viewport"
-            className="flex-1 overflow-x-hidden overflow-y-auto"
+            className="flex-1 overflow-x-hidden overflow-y-auto [overflow-anchor:none]"
           >
             <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
               <ThreadPrimitive.Empty>
@@ -870,8 +866,7 @@ function AcpChrome({
             </div>
           </ThreadPrimitive.Viewport>
           {/* Phone-only quick "jump to bottom" while scrolled up in a long
-              transcript. Desktop relies on the mouse wheel + autoScroll re-pin,
-              so it is gated to coarse pointers to avoid crowding that layout. */}
+              transcript. Coarse-pointer gating avoids crowding desktop. */}
           {isCoarse && !atBottom && (
             <button
               type="button"
@@ -1758,6 +1753,7 @@ export function SystemNotices({
   status,
   lagged,
   rateLimit,
+  rateLimitRetriesExhausted,
   hasEverOpened,
   reconnecting,
   retryCount,
@@ -1772,6 +1768,7 @@ export function SystemNotices({
   status: AcpContext["status"];
   lagged: boolean;
   rateLimit: AcpState["rateLimit"];
+  rateLimitRetriesExhausted: boolean;
   hasEverOpened: boolean;
   reconnecting: boolean;
   retryCount: number;
@@ -1788,7 +1785,7 @@ export function SystemNotices({
   // `maxRetries` and we're sitting on a dead WS. Surface the manual
   // affordance instead of a status line so the user has a clear path
   // back to live. See #1130.
-  const retriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
+  const reconnectRetriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
   if (reconnecting && status !== "open") {
     // Auto-retry banner: "Reconnecting (3/7) in 4s". Replaces the bare
     // "Reconnecting…" copy with concrete progress so the user knows
@@ -1810,7 +1807,7 @@ export function SystemNotices({
         ? "Structured view reconnecting… showing cached transcript; new messages disabled."
         : "Starting structured view worker… this can take a few seconds for new sessions.",
     });
-  } else if (status === "closed" && !retriesExhausted) {
+  } else if (status === "closed" && !reconnectRetriesExhausted) {
     messages.push({
       kind: "warn",
       text: hasEverOpened
@@ -1837,8 +1834,14 @@ export function SystemNotices({
           : `Rate-limited (${rateLimit.kind}); ${rateLimitWording(rateLimit.status)}`,
     });
   }
+  if (rateLimitRetriesExhausted) {
+    messages.push({
+      kind: "warn",
+      text: "Auto-resume stopped: the same prompt was re-sent too many times without getting through. Resume manually or send a new prompt.",
+    });
+  }
   const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";
-  if (messages.length === 0 && !retriesExhausted) return null;
+  if (messages.length === 0 && !reconnectRetriesExhausted) return null;
   return (
     <div className="border-b border-surface-800 px-4 py-2 space-y-1">
       {messages.map((m, i) => (
@@ -1879,7 +1882,7 @@ export function SystemNotices({
       {rateLimit && rateLimitResumeState === "failed" && rateLimitResumeError && (
         <div className="pt-1 text-xs text-brand-400">Resume failed: {rateLimitResumeError}</div>
       )}
-      {retriesExhausted && (
+      {reconnectRetriesExhausted && (
         <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
           <span>Connection lost. Auto-retry stopped.</span>
           <button
