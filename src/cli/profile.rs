@@ -15,7 +15,8 @@ pub enum ProfileCommands {
     /// Create a new profile
     #[command(alias = "new")]
     Create {
-        /// Profile name
+        /// Profile name: letters, digits, `_` and `-` only, at most 64
+        /// characters; `all` is reserved
         name: String,
     },
 
@@ -31,7 +32,7 @@ pub enum ProfileCommands {
     Rename {
         /// Current profile name
         old_name: String,
-        /// New profile name
+        /// New profile name (same rules as `aoe profile create`)
         new_name: String,
     },
 
