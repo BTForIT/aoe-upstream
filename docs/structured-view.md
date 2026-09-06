@@ -1,6 +1,6 @@
 # Structured View (Web Dashboard)
 
-The **structured view** is the default rendering for AI coding agents in the web dashboard and the native TUI. Instead of a terminal pane (PTY bytes through xterm.js), it renders the agent's structured state directly: plan, tool-call cards, diffs, and approvals. It is mobile-first and scales the same components into a richer multi-pane desktop layout.
+The **structured view** is the default rendering for AI coding agents in the web dashboard and the native TUI. Instead of a terminal pane showing the agent's rendered screen, it renders the agent's structured state directly: plan, tool-call cards, diffs, and approvals. It is mobile-first and scales the same components into a richer multi-pane desktop layout.
 
 It speaks the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP), a JSON-RPC standard for editor-agent communication. aoe is the *client*; the agent (Claude Code, Gemini, Codex, etc.) is the *server*. Any ACP-capable agent uses the structured view by default; a session can opt into the **terminal view** instead, per session, and you can switch at any time. Agents with no ACP adapter always run in the terminal view.
 
@@ -85,7 +85,6 @@ aoe add . --agent codex --model gpt-5       # pick an ACP agent + model (implies
 `--agent` for an uninstalled adapter errors with an install hint; `--structured-view` (no `--agent`) falls back to the terminal view with a warning so the command still succeeds.
 ## Requirements
 
-- aoe built with `--features serve`.
 - Node.js 22+ on `PATH` (the structured view spawns an ACP agent subprocess; `aoe-agent` declares `engines.node: >=22.0.0`).
 - For Claude Code, a `claude login` session.
 

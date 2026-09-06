@@ -3,12 +3,55 @@
 
 use super::*;
 
+const IDENTITY_PUBLISHER_DEPENDENCY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+fn identity_publisher_dependencies_available(container: &containers::DockerContainer) -> bool {
+    let check = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "command -v sh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1".to_string(),
+    ];
+    let argv = container.build_exec_argv("", &check);
+    let Some((program, args)) = argv.split_first() else {
+        return false;
+    };
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let available = matches!(
+        crate::process::run_with_timeout(
+            &mut command,
+            IDENTITY_PUBLISHER_DEPENDENCY_TIMEOUT,
+        ),
+        Ok(Some(output)) if output.status.success()
+    );
+    if !available {
+        tracing::warn!(
+            target: "hooks.install",
+            container = %container.name,
+            "sandbox identity hooks need sh and jq; install both in the custom image to enable native session identity publication"
+        );
+    }
+    available
+}
+
+fn identity_publisher_mount_matches(
+    container: &containers::DockerContainer,
+    config: &crate::containers::ContainerConfig,
+) -> Result<bool> {
+    Ok(container.mount_fingerprint_matches(config)? == Some(true))
+}
+
 impl Instance {
     /// Resolve the effective `environment` list for this session's profile,
     /// falling back to the global list when the profile has no override.
     pub(super) fn profile_host_environment(&self) -> Vec<String> {
         let profile = self.effective_profile();
-        crate::session::profile_config::resolve_config_or_warn(&profile).environment
+        crate::session::config::profile_config::resolve_config_or_warn(&profile).environment
     }
 
     /// The host environment the agent process will actually see: the static
@@ -39,6 +82,34 @@ impl Instance {
         environment
     }
 
+    /// Whether this session still reads the shared sandbox store, so its next
+    /// container launch first copies that store; see [`Self::move_sandbox_store`].
+    pub fn sandbox_store_move_pending(&self) -> bool {
+        self.is_sandboxed()
+            && self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
+    }
+
+    /// Move this session's sandbox store into the private layout, narrating
+    /// the copy to `reporter`. `Ok(false)` means the container is up, so the
+    /// store cannot move yet and nothing was attempted. The row is read back
+    /// from disk by the caller, not here: the TUI's copy lives in its own
+    /// mirror.
+    ///
+    /// A running container is worth skipping outright: its cohort cannot
+    /// move while it is up, so the pass is guaranteed to refuse, and it is
+    /// not free, since planning takes the v027 lock and every registry's
+    /// storage lock, on which `Storage::update` waits.
+    pub fn move_sandbox_store(
+        &self,
+        reporter: Option<crate::migrations::progress::Reporter>,
+    ) -> Result<bool> {
+        if DockerContainer::from_session_id(&self.id).is_running()? {
+            return Ok(false);
+        }
+        crate::migrations::migrate_sandbox_store_for_with(&self.id, reporter)?;
+        Ok(true)
+    }
+
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
         let detect_as = self.effective_detect_as().into_owned();
         let image = self
@@ -48,6 +119,34 @@ impl Instance {
             .image
             .clone();
         let container = DockerContainer::new(&self.id, &image);
+        // Charge the sandbox store move to the session that needs it, at the
+        // one chokepoint every entry point shares: tmux launches, ACP
+        // structured sessions and a bare container terminal all arrive here.
+        // The TUI runs it ahead of time on a worker so this is a no-op there;
+        // see `tui::store_move_poller`. It must stay above the shared flock
+        // below, which the move takes exclusively to plan and publish. A
+        // failure leaves the row on its shared store for a later attempt
+        // rather than blocking the launch.
+        if self.sandbox_store_move_pending() {
+            match self.move_sandbox_store(Some(crate::migrations::progress::tracing_reporter())) {
+                Ok(true) => self.reconcile_from_disk(),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    session_id = %self.id,
+                    %error,
+                    "sandbox store move deferred; session continues on its shared store"
+                ),
+            }
+        }
+        let _transition_lock =
+            if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+                Some(crate::session::acquire_storage_shared_flock(
+                    &crate::session::get_app_dir()?,
+                    crate::migrations::v027_isolate_sandbox_stores::LOCK,
+                )?)
+            } else {
+                None
+            };
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -55,15 +154,32 @@ impl Instance {
         // an actionable error rather than silently falling through to a
         // create attempt that would also fail. See #2596.
         if container.is_running()? {
+            if self.sandbox_store_generation >= container_config::CURRENT_SANDBOX_STORE_GENERATION
+                && container.sandbox_store_generation_matches()? == Some(false)
+            {
+                anyhow::bail!(
+                    "running sandbox {} uses a legacy store generation; stop it before relaunch",
+                    self.id
+                );
+            }
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
+            if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+                self.backfill_container_workdir(&container);
+                return Ok(container);
+            }
             container_config::refresh_agent_configs_for_instance(
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
                 Some(detect_as.as_str()),
             );
+            let config = self.build_container_config()?;
+            self.identity_publisher_launched = config.identity_publisher_installed
+                && identity_publisher_mount_matches(&container, &config)?
+                && identity_publisher_dependencies_available(&container)
+                && self.hook_session_publisher_allowed_by_argv();
             self.backfill_container_workdir(&container);
             container_config::ensure_folder_trust_config_for_active_agent(
                 &self.tool,
@@ -76,27 +192,43 @@ impl Instance {
             return Ok(container);
         }
 
+        if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+            anyhow::bail!(
+                "sandbox store transition is pending for {}; stop the other sandboxed sessions sharing this agent's store, then relaunch it or run `aoe migrate`",
+                self.id
+            );
+        }
+
         if container.exists()? {
-            // Restart of a stopped container is a come-up: refresh so a
-            // short-lived token is re-minted.
-            self.ensure_before_start_env(true)?;
-            container_config::refresh_agent_configs_for_instance(
-                &self.effective_profile(),
-                &self.id,
-                &self.tool,
-                Some(detect_as.as_str()),
-            );
-            container.start()?;
-            self.backfill_container_workdir(&container);
-            container_config::ensure_folder_trust_config_for_active_agent(
-                &self.tool,
-                Some(detect_as.as_str()),
-                &self.source_profile,
-                &self.id,
-                &self.container_workdir(),
-                self.is_yolo_mode(),
-            );
-            return Ok(container);
+            if container.sandbox_store_generation_matches()? == Some(false) {
+                container.remove(false)?;
+            } else {
+                // Restart of a stopped container is a come-up: refresh so a
+                // short-lived token is re-minted.
+                self.ensure_before_start_env(true)?;
+                container_config::refresh_agent_configs_for_instance(
+                    &self.effective_profile(),
+                    &self.id,
+                    &self.tool,
+                    Some(detect_as.as_str()),
+                );
+                let config = self.build_container_config()?;
+                container.start()?;
+                self.identity_publisher_launched = config.identity_publisher_installed
+                    && identity_publisher_mount_matches(&container, &config)?
+                    && identity_publisher_dependencies_available(&container)
+                    && self.hook_session_publisher_allowed_by_argv();
+                self.backfill_container_workdir(&container);
+                container_config::ensure_folder_trust_config_for_active_agent(
+                    &self.tool,
+                    Some(detect_as.as_str()),
+                    &self.source_profile,
+                    &self.id,
+                    &self.container_workdir(),
+                    self.is_yolo_mode(),
+                );
+                return Ok(container);
+            }
         }
 
         // Ensure image is available (always pulls to get latest)
@@ -107,7 +239,20 @@ impl Instance {
         // carries the values (leak-safe via the inherit path in run_create).
         self.ensure_before_start_env(true)?;
         let config = self.build_container_config()?;
+        // Still the workdir the *previous* container was created with; the pin below
+        // is what moves it forward.
+        let stranded = container_config::stranded_named_ignore_volumes(
+            &config,
+            &self.id,
+            self.sandbox_info
+                .as_ref()
+                .and_then(|sandbox| sandbox.container_workdir.as_deref()),
+        );
+        container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         let container_id = container.create(&config)?;
+        self.identity_publisher_launched = config.identity_publisher_installed
+            && identity_publisher_dependencies_available(&container)
+            && self.hook_session_publisher_allowed_by_argv();
 
         if let Some(ref mut sandbox) = self.sandbox_info {
             sandbox.container_id = Some(container_id);
@@ -182,10 +327,11 @@ impl Instance {
         // sandbox installs status hooks into that agent's config, matching the
         // host path. Gated by the same setting; only applies to agents that
         // declare selected_agent_hooks.
-        let merge_selected =
-            crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
-                .session
-                .merge_hooks_into_selected_agent;
+        let merge_selected = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        )
+        .session
+        .merge_hooks_into_selected_agent;
         let selected_agent = if merge_selected {
             // Mirror the host path's agent resolution (a custom wrapper detected
             // as kiro carries kiro's sidecar via detect_as), and the sandbox's
@@ -228,7 +374,7 @@ impl Instance {
             return Ok(());
         }
         let commands =
-            crate::session::repo_config::resolve_before_start_hooks(&self.source_profile);
+            crate::session::config::repo_config::resolve_before_start_hooks(&self.source_profile);
         if commands.is_empty() {
             if let Some(sb) = self.sandbox_info.as_mut() {
                 sb.before_start_env.clear();
@@ -243,7 +389,7 @@ impl Instance {
             return Ok(());
         }
 
-        let hook_env = crate::session::repo_config::lifecycle_env_vars(self);
+        let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
         let project_path = PathBuf::from(&self.project_path);
         // Feed the session's sandbox env into the hook so it can read a
         // per-session value (e.g. `$TEST_VAR`) to scope what it mints.
@@ -260,7 +406,7 @@ impl Instance {
                 )
             })
             .unwrap_or_default();
-        let minted = crate::session::repo_config::run_before_start_hooks(
+        let minted = crate::session::config::repo_config::run_before_start_hooks(
             &commands,
             &project_path,
             &hook_env,
@@ -289,19 +435,19 @@ impl Instance {
     /// must mint here, or `before_session` would silently not run for it.
     ///
     /// Resolved from global + profile config only; a repo cannot contribute the
-    /// command. See [`crate::session::repo_config::resolve_before_session_hooks`].
+    /// command. See [`crate::session::config::repo_config::resolve_before_session_hooks`].
     pub(super) fn mint_host_session_env(&mut self) -> Result<()> {
         self.pending_host_env.clear();
         if self.is_sandboxed() {
             return Ok(());
         }
         let commands =
-            crate::session::repo_config::resolve_before_session_hooks(&self.source_profile);
+            crate::session::config::repo_config::resolve_before_session_hooks(&self.source_profile);
         if commands.is_empty() {
             return Ok(());
         }
-        let hook_env = crate::session::repo_config::lifecycle_env_vars(self);
-        self.pending_host_env = crate::session::repo_config::run_before_session_hooks(
+        let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
+        self.pending_host_env = crate::session::config::repo_config::run_before_session_hooks(
             &commands,
             Path::new(&self.project_path),
             &hook_env,

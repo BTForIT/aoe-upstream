@@ -251,7 +251,6 @@ impl HomeView {
             plugin_manager_dialog: None,
             skills_manager_dialog: None,
             command_palette: None,
-            #[cfg(feature = "serve")]
             serve_view: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
@@ -284,7 +283,10 @@ impl HomeView {
             expand_strip_area: Rect::default(),
             footer_buttons: Vec::new(),
             footer_hover: None,
-            preview_pane_synced: None,
+            passive_pane_synced: std::collections::HashMap::new(),
+            passive_pane_declined: std::collections::HashMap::new(),
+            passive_pane_queued: std::collections::HashMap::new(),
+            passive_fleet_armed: None,
             preview_pane_pending: None,
             pending_paste: None,
             pending_attach_after_warning: None,
@@ -293,11 +295,8 @@ impl HomeView {
             pending_stop_tool: None,
             pending_image_pull: None,
             pending_switch_view_session: None,
-            #[cfg(feature = "serve")]
             pending_daemon_start_session: None,
-            #[cfg(feature = "serve")]
             structured_preview: None,
-            #[cfg(feature = "serve")]
             structured_preview_pending: false,
             pending_force_remove_session: None,
             pending_trash_session: None,
@@ -324,9 +323,7 @@ impl HomeView {
             system_health_discovered: user_config
                 .as_ref()
                 .is_some_and(|config| config.app_state.used_system_health),
-            #[cfg(feature = "serve")]
             daemon_status_poller: crate::tui::daemon_status_poller::DaemonStatusPoller::new(),
-            #[cfg(feature = "serve")]
             pending_daemon_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
@@ -337,6 +334,9 @@ impl HomeView {
             reconcile_reload_retry_at: None,
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            store_move_poller: crate::tui::store_move_poller::StoreMovePoller::new(),
+            store_move_in_flight: None,
+            store_move_bypass: None,
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),

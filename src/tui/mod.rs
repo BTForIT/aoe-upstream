@@ -3,10 +3,10 @@
 mod app;
 mod attach_project_poller;
 mod attached_status_hooks;
+mod boot_spinner;
 pub(crate) mod clipboard;
 mod components;
 mod creation_poller;
-#[cfg(feature = "serve")]
 mod daemon_status_poller;
 mod deletion_poller;
 pub mod dialogs;
@@ -14,19 +14,16 @@ pub mod diff;
 pub(crate) mod home;
 pub(crate) mod markdown;
 mod metrics_poller;
-#[cfg(feature = "serve")]
 pub(crate) mod open_url;
-#[cfg(feature = "serve")]
 pub(crate) mod plugin_ui;
 mod reconcile_poller;
-#[cfg(feature = "serve")]
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
 mod restart_poller;
 pub mod settings;
 mod status_poller;
 mod stop_poller;
-#[cfg(feature = "serve")]
+mod store_move_poller;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
 mod trash_poller;
@@ -61,7 +58,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 
 use crate::migrations;
 
@@ -226,31 +223,51 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // sees a session list that doesn't reflect the daemon they pointed
     // us at. Tmux check + migrations are intentionally skipped here:
     // the remote machine owns those, this side is a pure client.
-    #[cfg(feature = "serve")]
     if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
         let _ = startup_warning; // remote mode skips the local startup-warning channel
         let _ = profile;
         return remote_home::run_standalone(endpoint).await;
     }
 
-    // Run pending migrations with a spinner so users see progress
-    if migrations::has_pending_migrations() {
-        const SPINNER_FRAMES: &[char] = &['◐', '◓', '◑', '◒'];
-        let migration_handle = tokio::task::spawn_blocking(migrations::run_migrations);
+    // Run pending migrations with a spinner that names the migration, its
+    // current step and the elapsed time, and keeps the notices a migration
+    // emits (what is being moved, how to defer it) on screen. Unconditional
+    // because the spinner writes nothing until a migration reports something,
+    // so the schema-current path costs nothing. This covers the startup pass
+    // only: v027's per-session store move runs from a launch, on the store
+    // move poller, and narrates itself on the home status line.
+    {
+        let console = std::sync::Arc::new(std::sync::Mutex::new(
+            migrations::progress::ConsoleProgress::default(),
+        ));
+        let reporter: migrations::progress::Reporter = {
+            let console = console.clone();
+            std::sync::Arc::new(move |event| {
+                console
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .apply(event);
+            })
+        };
+        let migration_handle =
+            tokio::task::spawn_blocking(move || migrations::run_migrations_with(Some(reporter)));
         tokio::pin!(migration_handle);
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
         let mut frame = 0usize;
+        let mut spinner = boot_spinner::BootSpinner::default();
         loop {
             tokio::select! {
                 result = &mut migration_handle => {
-                    print!("\r\x1b[2K");
-                    let _ = io::stdout().flush();
+                    let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = spinner.finish(&mut io::stdout(), &mut console);
+                    drop(console);
                     result??;
                     break;
                 }
                 _ = tick.tick() => {
-                    print!("\r  {} Running data migrations...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]);
-                    let _ = io::stdout().flush();
+                    let width = crate::terminal::get_size().map_or(80, |(w, _)| w as usize);
+                    let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = spinner.draw(&mut io::stdout(), &mut console, frame, width);
                     frame += 1;
                 }
             }

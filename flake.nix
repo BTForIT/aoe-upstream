@@ -97,7 +97,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-KBpbvnYwJB7nJgSs5N6crXhn05dQF6fbyRHLumMZZ/Y=";
+            npmDepsHash = "sha256-io9zO/wjWtpdGSBLiRhLouf7qexAsBHb27GZ317r89M=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out
@@ -109,10 +109,10 @@
           # build.rs respects AOE_WEB_DIST to use the pre-built frontend.
           # buildDepsOnly uses a dummy crate source so AOE_WEB_DIST is irrelevant there.
           commonArgsWithWeb = commonArgs // {
-            cargoExtraArgs = "--package agent-of-empires --features serve";
+            cargoExtraArgs = "--package agent-of-empires --features web";
           };
 
-          # Rust dep cache compiled with --features serve (no npm involved).
+          # Rust dep cache compiled with --features web (no npm involved).
           cargoArtifactsWithWeb = craneLib.buildDepsOnly commonArgsWithWeb;
 
           aoeWithWeb = craneLib.buildPackage (commonArgsWithWeb // {
@@ -175,7 +175,7 @@
             packages = with pkgs; [
               rust-analyzer
               tmux
-              nodejs # for web frontend development (--features serve)
+              nodejs # for web frontend development (--features web)
             ];
           };
         };
