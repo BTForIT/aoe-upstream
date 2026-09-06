@@ -793,13 +793,17 @@ pub fn delete_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rename a profile directory.
+///
+/// The source is held to the permissive traversal guard only, so a stray
+/// minted by an older binary (spaces, emoji) stays renameable — repairing
+/// such a name is what rename is for. The destination is a profile being
+/// created under a new name and is held to the same grammar as
+/// `create_profile`; otherwise rename is a back door that mints exactly the
+/// shapes the daemon API refuses.
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    if new_name.is_empty() {
-        anyhow::bail!("New profile name cannot be empty");
-    }
-    if new_name.contains('/') || new_name.contains('\\') {
-        anyhow::bail!("Profile name cannot contain path separators");
-    }
+    validate_profile_name(old_name)?;
+    validate_new_profile_name(new_name)?;
 
     let base = get_app_dir()?;
     let old_dir = base.join("profiles").join(old_name);
@@ -1819,6 +1823,68 @@ mod tests {
         delete_profile(stray).expect("a pre-existing spaced stray must be deletable");
         assert!(!dir.join("profiles").join(stray).exists());
         assert!(dir.join("profiles").join("forit-main").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_rename_profile_applies_create_grammar_to_destination() {
+        // A rename DESTINATION is a profile being created under a new name,
+        // so it is held to the same grammar as `aoe profile create`: no
+        // spaces, emoji, reserved words, or overlong names. Otherwise rename
+        // is a back door that mints exactly the shapes the API refuses.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
+
+        let too_long = "a".repeat(65);
+        for bad in [
+            "has space",
+            "emoji\u{1f600}",
+            "all",
+            "a.b",
+            too_long.as_str(),
+        ] {
+            let err = rename_profile("real", bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected rename to refuse destination {bad:?}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("disallowed characters")
+                    || msg.contains("reserved")
+                    || msg.contains("too long"),
+                "unexpected error for {bad:?}: {msg}"
+            );
+            assert!(
+                dir.join("profiles").join("real").exists(),
+                "source must be untouched after refusing {bad:?}"
+            );
+            assert!(!dir.join("profiles").join(bad).exists());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_rename_profile_repairs_preexisting_stray_source() {
+        // The SOURCE stays permissive, like deletion: a spaced stray minted
+        // by an older binary is exactly what rename exists to repair, so only
+        // the traversal guard applies to it.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        let stray = "forit-main a83bcfb5d2e14f60 for-Christine Loop";
+        fs::create_dir_all(dir.join("profiles").join(stray)).unwrap();
+
+        rename_profile(stray, "forit-main").expect("a spaced stray must be renameable");
+        assert!(!dir.join("profiles").join(stray).exists());
+        assert!(dir.join("profiles").join("forit-main").exists());
+
+        // Traversal on the source is still refused, and nothing is moved.
+        fs::create_dir_all(dir.join("bystander")).unwrap();
+        let err = rename_profile("../bystander", "escaped").expect_err("traversal source");
+        assert!(err.to_string().contains("path separators"), "{err}");
+        assert!(dir.join("bystander").exists());
+        assert!(!dir.join("profiles").join("escaped").exists());
     }
 
     #[test]
