@@ -322,8 +322,7 @@ impl SettingsView {
             .map(repo_config_to_profile)
             .unwrap_or_default();
 
-        // The profile-scope cycler is a picker, so it takes picker order
-        // (`default` last).
+        // The profile-scope cycler is a picker, so `default` sorts last.
         let mut available_profiles = match list_profiles_for_display() {
             Ok(p) => p,
             Err(e) => {

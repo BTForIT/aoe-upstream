@@ -81,11 +81,9 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let profile_name = "<global>";
-    // `<` / `>` are outside the profile-creation grammar, so this name can no
-    // longer be minted through `Storage::new` / `get_profile_dir`. A directory
-    // left behind by an older binary still opens (reads never run the create
-    // gate), and that legacy shape is exactly what the enum key has to keep
-    // apart from the app-wide subscription: lay it down on disk directly.
+    // `<` and `>` are outside the create grammar, so lay the directory down
+    // directly: a legacy profile of this shape still opens, and that is what
+    // the key must keep apart from the app-wide subscription.
     let profile_dir = crate::session::get_app_dir()
         .unwrap()
         .join("profiles")

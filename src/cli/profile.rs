@@ -77,8 +77,8 @@ pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> 
 }
 
 async fn list_profiles() -> Result<()> {
-    // Picker order (`default` last); resolution below still uses the plain
-    // enumeration through `resolve_default_profile`.
+    // Picker order (`default` last); resolution below stays on the plain
+    // enumeration.
     let profiles = session::list_profiles_for_display()?;
 
     if profiles.is_empty() {

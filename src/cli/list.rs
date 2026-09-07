@@ -576,10 +576,8 @@ mod tests {
         }
     }
 
-    /// Argument-level pin for the #148 auto-mint guard: `list --all`
-    /// enumerates every profile and never consumes `--profile`, so a stale
-    /// or mistyped `-p` must not block it; the single-profile form goes
-    /// through `Storage::open_unwatched`, which refuses an unknown name.
+    /// `list --all` never consumes `--profile`; the single-profile form goes
+    /// through `Storage::open_unwatched`, which refuses an unknown name (#148).
     mod profile_guard {
         use crate::cli::{Cli, Commands};
         use clap::Parser;

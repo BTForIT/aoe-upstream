@@ -1,7 +1,7 @@
 //! Regression coverage for the lazy-profile-creation bug: naming an unknown
 //! profile via `-p`/`--profile` on a read-path command must error instead of
 //! silently birthing an empty `profiles/<name>/` directory. See
-//! `session::resolve_existing_profile`.
+//! `session::require_known_profile`.
 
 use serial_test::parallel;
 

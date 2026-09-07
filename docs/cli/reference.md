@@ -168,7 +168,7 @@ Run without arguments to launch the TUI dashboard.
 
 ###### **Options:**
 
-* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Must name an existing profile: an unknown name is refused, not created; make one with `aoe profile create`
+* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it
 * `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
 
 

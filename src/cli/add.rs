@@ -178,11 +178,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         bail!("--interactive requires a terminal; pass --title for non-interactive naming");
     }
 
-    // `add` files the new session under `profile`, and `Storage::new_unwatched`
-    // below vivifies the profile directory to do so. An unknown name is
-    // refused here, before any other argument is validated, so a bare
-    // `-p typo` never mints a stray profile (#148); profiles are created only
-    // by `aoe profile create`.
+    // `add` files the session under `profile` and would create its
+    // directory; refuse an unknown name before anything else (#148).
     crate::session::require_known_profile(profile)?;
 
     // Scratch sessions have no project path; the scratch directory is
@@ -1792,9 +1789,7 @@ mod tests {
         assert_eq!(image, HARDCODED);
     }
 
-    /// Argument-level coverage of the #148 auto-mint guard on `add`, the
-    /// one CLI verb that files a session under `--profile` (the vivify
-    /// point is `Storage::new_unwatched` in `run`).
+    /// Argument-level coverage of the #148 guard on `add`.
     mod profile_guard {
         use crate::cli::{Cli, Commands};
         use clap::Parser;
@@ -1816,9 +1811,8 @@ mod tests {
             let profiles = crate::session::get_app_dir().unwrap().join("profiles");
             std::fs::create_dir_all(profiles.join("real")).unwrap();
 
-            // A path that does not exist keeps the run short of any tmux
-            // work even if the guard were missing; the assertion is on WHICH
-            // error answers, so the profile check has to come first.
+            // The missing path keeps the run short of tmux; the assertion is
+            // on which error answers first.
             let (profile, args) = dispatch_argv(&[
                 "aoe",
                 "add",

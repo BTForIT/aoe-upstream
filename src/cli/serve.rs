@@ -898,11 +898,9 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         return restart_daemon().await;
     }
 
-    // A fresh start files its sessions under `profile`; the lifecycle verbs
-    // above never read it, so a stale `AGENT_OF_EMPIRES_PROFILE` can always
-    // stop or inspect a running daemon. Refuse an unknown name before any
-    // other validation or side effect (PID file, port bind) so a bare
-    // `-p typo` never mints a stray profile (#148).
+    // A fresh start files sessions under `profile`; the lifecycle verbs
+    // above never read it. Refuse an unknown name before any side effect
+    // (#148).
     crate::session::require_known_profile(profile)?;
 
     // Resolve CityHall mode once: the `--cityhall` flag and the
@@ -2217,10 +2215,8 @@ mod tests {
         assert!(!launch_needs_passphrase(&launch));
     }
 
-    /// Argument-level coverage of the #148 auto-mint guard: parse a real
-    /// argv and dispatch it the way `main` does, so the test pins which
-    /// `serve` shapes consume `--profile` rather than a hand-built args
-    /// struct.
+    /// Parses real argv and dispatches like `main`, pinning which `serve`
+    /// shapes consume `--profile` (#148).
     mod profile_guard {
         use super::super::run;
         use crate::cli::{Cli, Commands};
@@ -2237,8 +2233,7 @@ mod tests {
             }
         }
 
-        /// Isolated app dir with one real profile, so the guard is armed
-        /// (an empty `profiles/` is the first-run exemption).
+        /// Isolated app dir with one profile, so the guard is armed.
         fn armed_profiles_dir() -> (crate::session::test_support::AppDirGuard, PathBuf) {
             let guard = crate::session::test_support::isolate_app_dir();
             let profiles = crate::session::get_app_dir().unwrap().join("profiles");
@@ -2252,10 +2247,8 @@ mod tests {
             let (_guard, profiles) = armed_profiles_dir();
             for verb in ["--stop", "--status", "--restart"] {
                 let (profile, args) = dispatch_argv(&["aoe", "serve", verb, "-p", "ghost-profile"]);
-                // No daemon runs in the isolated dir, so each verb reports
-                // that; what matters is that the report is about the daemon,
-                // never about the profile, so a stale AGENT_OF_EMPIRES_PROFILE
-                // can always stop or inspect a running daemon.
+                // No daemon runs here; the report must be about the daemon,
+                // never the profile.
                 if let Err(e) = run(&profile, args).await {
                     let msg = e.to_string();
                     assert!(
@@ -2274,10 +2267,8 @@ mod tests {
         #[serial]
         async fn fresh_start_refuses_unknown_profile_before_any_side_effect() {
             let (_guard, profiles) = armed_profiles_dir();
-            // `--behind-proxy` without `--allowed-host` is refused by the
-            // argument validation that runs right after the guard, so the
-            // start can never reach a port bind in this test; the guard has
-            // to win that race for an unknown profile.
+            // `--behind-proxy` without `--allowed-host` fails right after the
+            // guard, so no port is ever bound.
             let (profile, args) =
                 dispatch_argv(&["aoe", "serve", "--behind-proxy", "-p", "ghost-profile"]);
             let msg = run(&profile, args)

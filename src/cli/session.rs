@@ -445,9 +445,7 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
         other => Some(other.to_string()),
     };
 
-    // Patching an existing session never needs to create the profile; an
-    // unknown name is refused (#148) instead of vivified and then failing
-    // on the missing session.
+    // Patching an existing session never creates the profile (#148).
     let storage = Storage::open_unwatched(profile)?;
     let (title, color) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
@@ -3082,10 +3080,8 @@ mod set_color_tests {
         assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
     }
 
-    /// `session set-color -p <unknown>` is a read-then-patch on an existing
-    /// store: it must refuse an unknown profile the way the other session
-    /// verbs do, not vivify `profiles/<unknown>/` and then fail on the
-    /// missing session (#148).
+    /// `session set-color -p <unknown>` refuses the profile instead of
+    /// creating it and then failing on the missing session (#148).
     #[tokio::test]
     #[serial]
     async fn set_color_refuses_unknown_profile_without_vivifying_it() {
