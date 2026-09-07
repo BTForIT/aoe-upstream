@@ -18,6 +18,11 @@ impl Instance {
         }
         self.lifecycle_generation = src.lifecycle_generation;
         self.status = src.status;
+        // A launch decided before a peer archived the row reports a pane
+        // the archive tore down.
+        if self.is_archived() {
+            self.settle_archived_status();
+        }
         self.sandbox_info = src.sandbox_info.clone();
         self.capture_started_at = src.capture_started_at;
     }
@@ -708,12 +713,24 @@ mod tests {
 
         stored.merge_post_start(&working);
 
-        assert_eq!(stored.status, Status::Starting);
+        assert_eq!(
+            stored.status,
+            Status::Idle,
+            "an archived row must not import a live status"
+        );
         assert!(stored.is_archived(), "peer archive must survive merge");
         assert_eq!(
             stored.agent_session_id.as_deref(),
             Some("daemon-sid"),
             "peer-written sid must survive merge"
+        );
+
+        working.status = Status::Waiting;
+        stored.merge_post_restart(&working);
+        assert_eq!(
+            stored.status,
+            Status::Idle,
+            "restart merge inherits the archived settle"
         );
 
         stored.lifecycle_generation = 2;
