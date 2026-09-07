@@ -215,7 +215,9 @@ function daemonEnvVars(): string[] {
     /env::var(?:_os)?\(\s*"([A-Z][A-Z0-9_]*)"/g,
     /\benv\s*=\s*"([A-Z][A-Z0-9_]*)"/g,
     /"([A-Z][A-Z0-9_]*_(?:HOME|DIR|DB|PATH|CREDENTIALS))"/g,
-    /const\s+[A-Z0-9_]+\s*:\s*&(?:'static\s+)?str\s*=\s*"([A-Z][A-Z0-9_]*)"/g,
+    // Two characters or more: a one-letter uppercase const is a key name
+    // (a tmux binding such as `L`), never an environment variable.
+    /const\s+[A-Z0-9_]+\s*:\s*&(?:'static\s+)?str\s*=\s*"([A-Z][A-Z0-9_]+)"/g,
   ];
   const names = new Set<string>();
   for (const file of rustFiles(srcDir)) {

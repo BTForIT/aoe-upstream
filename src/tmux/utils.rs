@@ -343,14 +343,20 @@ pub(crate) fn inside_tmux() -> bool {
     std::env::var("TMUX").is_ok()
 }
 
-/// The key that brings the client back to aoe after this process attaches in
-/// tmux mode: `prefix L` undoes a `switch-client`, `prefix d` ends an
-/// `attach-session`.
-pub fn attach_return_key() -> &'static str {
-    if inside_tmux() {
-        SWITCH_BACK_KEY
+/// The key hint for coming back to aoe after this process attaches in tmux
+/// mode. From outside tmux the attach is an `attach-session`, undone by
+/// `prefix d`. From inside tmux it is a `switch-client`, undone by
+/// `prefix L`, but with no client to switch (an inherited `TMUX`) it falls
+/// back to `attach-session`, so the hint names both keys.
+pub fn attach_return_hint() -> String {
+    attach_return_hint_for(inside_tmux())
+}
+
+pub(crate) fn attach_return_hint_for(inside_tmux: bool) -> String {
+    if inside_tmux {
+        format!("{SWITCH_BACK_KEY} (or {DETACH_KEY})")
     } else {
-        DETACH_KEY
+        DETACH_KEY.to_string()
     }
 }
 
@@ -424,6 +430,12 @@ mod tests {
     /// One tmux `set-option` write form emits exactly its tmux tokens: scope
     /// flags, `-q` when quiet, and no target for the server scope. This pins
     /// the emitted-args contract the table rows must keep (issue #3349).
+    #[test]
+    fn attach_return_hint_names_both_keys_inside_tmux() {
+        assert_eq!(attach_return_hint_for(true), "L (or d)");
+        assert_eq!(attach_return_hint_for(false), "d");
+    }
+
     #[test]
     fn test_tmux_option_write_emission() {
         use crate::session::config::TmuxOptionWrite;
