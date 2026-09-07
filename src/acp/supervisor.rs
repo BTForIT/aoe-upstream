@@ -754,6 +754,43 @@ fn log_wrapper_substitution(session_id: &str, tool: &str, wrapper: &str, base: &
     );
 }
 
+/// Re-run the spawn model/effort resolution on a `SpawnConfig` cached at
+/// first launch, so a pin changed since then applies to the respawn. The
+/// cached values stand in for the original request. They are resolved
+/// values, so when the pin moves the model, the effort keyed on the new
+/// model replaces a cached effort keyed on the old one.
+fn refresh_spawn_model_effort(
+    config: &mut SpawnConfig,
+    defaults: Option<&crate::session::config::AcpAgentDefaults>,
+) {
+    let cached_model = config
+        .provider_env
+        .iter()
+        .find(|(key, _)| key == "AOE_AGENT_MODEL")
+        .map(|(_, value)| value.clone());
+    let (model, mut effort) = crate::session::config::resolve_spawn_model_effort(
+        defaults,
+        cached_model.clone(),
+        config.default_effort.take(),
+    );
+    if model != cached_model {
+        if let Some(keyed) = defaults
+            .zip(model.as_deref())
+            .and_then(|(defaults, model)| defaults.effort_by_model.get(model))
+            .filter(|value| !value.is_empty())
+        {
+            effort = Some(keyed.clone());
+        }
+    }
+    config
+        .provider_env
+        .retain(|(key, _)| key != "AOE_AGENT_MODEL");
+    if let Some(model) = model {
+        config.provider_env.push(("AOE_AGENT_MODEL".into(), model));
+    }
+    config.default_effort = effort;
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     /// Constructor with no concurrency cap. Used in tests; production
     /// callers should use [`Supervisor::with_capacity`] so the
@@ -1749,13 +1786,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
-        // Resolve the per-agent structured-view defaults once, at this single
-        // spawn choke point, so CLI create, reconciler respawn, and web create
-        // all honor the same model/effort/mode defaults and the same pin. A
-        // pinned model wins over everything (so a persisted pre-pin model
-        // cannot launch off it on respawn); otherwise an explicit per-request
-        // model or effort wins and the configured default fills in. Mode has
-        // no per-request override today.
+        // Resolve the per-agent structured-view defaults at this single spawn
+        // choke point, so every create path honors the same model/effort/mode
+        // defaults and the same pin. A pin wins over everything; otherwise an
+        // explicit model or effort wins and the default fills in. Mode has no
+        // per-request override today. The worker's own respawn re-runs this
+        // on its cached config, see `refresh_spawn_model_effort`.
         // ponytail: resolve here instead of threading model/effort/mode through
         // every SpawnRequest site; revisit if explicit per-request values land.
         let acp_defaults = resolved_cfg.acp.acp_defaults_for(&agent);
@@ -2405,6 +2441,34 @@ impl<S: BroadcastSink> Supervisor<S> {
                         );
                         Vec::new()
                     });
+
+                    // The cached config carries the first launch's model and
+                    // effort. Re-run the spawn resolution so a pin changed
+                    // since then applies to this launch too.
+                    let pin_agent = respawn_config.agent_key.clone();
+                    let pin_profile = respawn_config.source_profile.clone().unwrap_or_default();
+                    let pin_cwd = respawn_config.cwd.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                            &pin_profile,
+                            &pin_cwd,
+                        )
+                        .acp
+                        .acp_defaults_for(&pin_agent)
+                        .cloned()
+                    })
+                    .await
+                    {
+                        Ok(defaults) => {
+                            refresh_spawn_model_effort(&mut respawn_config, defaults.as_ref())
+                        }
+                        Err(e) => warn!(
+                            target: "acp.supervisor",
+                            session = %session_id,
+                            error = %e,
+                            "model re-resolution on respawn failed; keeping the cached model"
+                        ),
+                    }
 
                     // Re-run `host_hooks.before_session` before the respawn, the
                     // same way `spawn_inner` runs it on first spawn: a
@@ -3915,6 +3979,75 @@ mod tests {
             args: args.iter().map(|s| s.to_string()).collect(),
             description: "test".into(),
             env_allowlist: None,
+        }
+    }
+
+    /// A respawn relaunches the `SpawnConfig` cached at first launch, so a
+    /// pin changed since then is re-applied to it, with the effort keyed on
+    /// the model it now launches on. Without a pin the cached values stand.
+    #[test]
+    fn respawn_refreshes_a_changed_pin_on_the_cached_config() {
+        use crate::session::config::AcpAgentDefaults;
+        let cached = SpawnConfig {
+            wrapper_substitution: None,
+            agent_key: "claude".into(),
+            tool: "claude".into(),
+            spec: spec("claude-agent-acp", &[]),
+            cwd: std::env::temp_dir(),
+            additional_dirs: vec![],
+            provider_env: vec![
+                ("AOE_AGENT_MODEL".into(), "model-a".into()),
+                ("OTHER".into(), "kept".into()),
+            ],
+            host_environment: vec![],
+            default_effort: Some("low".into()),
+            default_mode: None,
+            socket_path: None,
+            stored_acp_session_id: None,
+            fork_from: None,
+            seed_history_replay: false,
+            artifact_dir: None,
+            sandbox_info: None,
+            source_profile: None,
+            mcp_servers: Vec::new(),
+        };
+        let pin = |model: &str| AcpAgentDefaults {
+            model: Some(model.into()),
+            pin_model: true,
+            effort_by_model: [("model-b".to_string(), "high".to_string())].into(),
+            ..Default::default()
+        };
+        let unpinned = AcpAgentDefaults {
+            model: Some("model-b".into()),
+            ..Default::default()
+        };
+
+        for (name, defaults, want_model, want_effort) in [
+            ("pin moved to b", Some(pin("model-b")), "model-b", "high"),
+            ("pin still a", Some(pin("model-a")), "model-a", "low"),
+            ("no entry", None, "model-a", "low"),
+            ("plain default", Some(unpinned), "model-a", "low"),
+        ] {
+            let mut config = cached.clone();
+            refresh_spawn_model_effort(&mut config, defaults.as_ref());
+            let models: Vec<&str> = config
+                .provider_env
+                .iter()
+                .filter(|(key, _)| key == "AOE_AGENT_MODEL")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(models, [want_model], "{name}");
+            assert_eq!(
+                config.default_effort.as_deref(),
+                Some(want_effort),
+                "{name}"
+            );
+            assert!(
+                config
+                    .provider_env
+                    .contains(&("OTHER".into(), "kept".into())),
+                "{name}"
+            );
         }
     }
 

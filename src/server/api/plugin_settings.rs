@@ -257,18 +257,19 @@ async fn group_options(state: &Arc<AppState>) -> Vec<SelectOption> {
     paths.iter().map(|p| SelectOption::new(p, p)).collect()
 }
 
-/// The model pinned for `agent` in the resolved profile config, if any
-/// (`acp.acp_defaults.<agent>.pin_model = true` with a `model`). A plain
-/// `model` without the flag is a default, not a pin, and yields `None`: an
-/// explicit request still wins over a default at creation, so the picker must
-/// keep offering the full catalog for it.
+/// The model pinned under the profile for the agent `agent` spawns as, if
+/// any; see `pinned_model_for_tool`. A plain `model` without `pin_model` is a
+/// default an explicit request still beats at creation, so it yields `None`
+/// and the picker keeps the full catalog.
 async fn pinned_model_for_agent(profile: &str, agent: &str) -> Option<String> {
     let profile = profile.to_string();
     let agent = agent.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::session::config::profile_config::resolve_config_or_warn(&profile)
-            .acp
-            .pinned_model_for(&agent)
+        crate::acp::pinned_model_for_tool(
+            &crate::session::config::profile_config::resolve_config_or_warn(&profile),
+            &agent,
+            None,
+        )
     })
     .await
     .ok()
@@ -349,7 +350,9 @@ mod tests {
 
     /// The picker collapses only on an explicit pin. A plain
     /// `acp_defaults.<agent>.model` is a default (an explicit request still
-    /// wins at `sessions.create`), so it must keep the full catalog.
+    /// wins at `sessions.create`), so it must keep the full catalog. The pin
+    /// is keyed by the agent a session spawns as: a wrapper mapped to a base
+    /// agent through `agent_detect_as` reads the base pin.
     #[tokio::test]
     #[serial_test::serial]
     async fn picker_collapses_on_a_pin_but_not_on_a_default() {
@@ -360,7 +363,8 @@ mod tests {
             .join("config.toml");
         std::fs::write(
             &config_path,
-            "[acp.acp_defaults.opencode]\nmodel = \"openai/gpt-5.5\"\n\n\
+            "[session.agent_detect_as]\nmy-claude = \"claude\"\n\n\
+             [acp.acp_defaults.opencode]\nmodel = \"openai/gpt-5.5\"\n\n\
              [acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
         )
         .expect("write config");
@@ -368,6 +372,12 @@ mod tests {
         assert_eq!(pinned_model_for_agent("default", "opencode").await, None);
         assert_eq!(
             pinned_model_for_agent("default", "claude").await.as_deref(),
+            Some("claude-pinned")
+        );
+        assert_eq!(
+            pinned_model_for_agent("default", "my-claude")
+                .await
+                .as_deref(),
             Some("claude-pinned")
         );
         assert_eq!(pinned_model_for_agent("default", "gemini").await, None);

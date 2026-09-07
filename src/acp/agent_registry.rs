@@ -253,6 +253,61 @@ pub fn inherited_acp_base(tool: &str, agent_detect_as: &HashMap<String, String>)
         .map(|_| base.clone())
 }
 
+/// The agent a structured-view session of `tool` spawns as. Sync mirror of
+/// `Supervisor::pick_agent_for_tool` for the creation surfaces that must
+/// agree with the spawn without an async supervisor: add-time checks, the
+/// plugin pin gate, the settings model picker. Precedence: explicit
+/// override, tool-keyed registry entry, custom agent with `agent_acp_cmd`,
+/// custom agent inheriting a registry-backed base via `agent_detect_as`
+/// (resolves to the base key), `claude` for the claude tool, else
+/// `acp.default_agent`.
+pub fn pick_acp_agent_name(
+    registry: &AgentRegistry,
+    session: &crate::session::config::SessionConfig,
+    acp: &crate::session::config::AcpConfig,
+    tool: &str,
+    explicit_override: Option<&str>,
+) -> String {
+    if let Some(name) = explicit_override {
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    if registry.get(tool).is_some() {
+        return tool.to_string();
+    }
+    if session.agent_acp_cmd.contains_key(tool) {
+        return tool.to_string();
+    }
+    if let Some(base) = inherited_acp_base(tool, &session.agent_detect_as) {
+        return base;
+    }
+    if tool == "claude" {
+        "claude".into()
+    } else {
+        acp.resolved_default_agent().to_string()
+    }
+}
+
+/// The model pinned for the agent `tool` spawns as, if any. Keyed by the
+/// resolved agent rather than the requested id, so a wrapper mapped through
+/// `agent_detect_as` reads its base agent's pin: the entry the spawn
+/// resolver applies.
+pub fn pinned_model_for_tool(
+    config: &crate::session::config::Config,
+    tool: &str,
+    explicit_override: Option<&str>,
+) -> Option<String> {
+    let agent = pick_acp_agent_name(
+        &AgentRegistry::with_defaults(),
+        &config.session,
+        &config.acp,
+        tool,
+        explicit_override,
+    );
+    config.acp.pinned_model_for(&agent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +318,75 @@ mod tests {
         assert!(reg.get("claude-code").is_some());
         assert!(reg.get("aoe-agent").is_some());
         assert!(reg.get("omp").is_some());
+    }
+
+    /// The sync mirror names the agent a spawn runs, in the supervisor's
+    /// precedence order.
+    #[test]
+    fn pick_acp_agent_name_resolves_the_agent_a_spawn_runs() {
+        let registry = AgentRegistry::with_defaults();
+        let mut session = crate::session::config::SessionConfig::default();
+        session
+            .agent_detect_as
+            .insert("my-claude".into(), "claude".into());
+        session
+            .agent_detect_as
+            .insert("my-cursor".into(), "cursor".into());
+        session
+            .agent_acp_cmd
+            .insert("oc-sp".into(), "ocp run sp acp".into());
+        let mut acp = crate::session::config::AcpConfig::default();
+        acp.default_agent = "opencode".into();
+
+        for (tool, explicit, want) in [
+            ("claude", Some("gemini"), "gemini"),
+            ("claude", Some(""), "claude"),
+            ("opencode", None, "opencode"),
+            ("oc-sp", None, "oc-sp"),
+            ("my-claude", None, "claude"),
+            ("my-cursor", None, "opencode"),
+            ("claude", None, "claude"),
+            ("unknown", None, "opencode"),
+        ] {
+            assert_eq!(
+                pick_acp_agent_name(&registry, &session, &acp, tool, explicit),
+                want,
+                "{tool} / {explicit:?}"
+            );
+        }
+    }
+
+    /// The pin a creation surface enforces is keyed by the resolved agent, so
+    /// a wrapper reads its base agent's pin and an override reads its own.
+    #[test]
+    fn pinned_model_for_tool_reads_the_resolved_agents_pin() {
+        let mut config = crate::session::config::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("my-claude".into(), "claude".into());
+        config.acp.acp_defaults.insert(
+            "claude".into(),
+            crate::session::config::AcpAgentDefaults {
+                model: Some("claude-pinned".into()),
+                pin_model: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            pinned_model_for_tool(&config, "my-claude", None).as_deref(),
+            Some("claude-pinned")
+        );
+        assert_eq!(
+            pinned_model_for_tool(&config, "claude", None).as_deref(),
+            Some("claude-pinned")
+        );
+        assert_eq!(
+            pinned_model_for_tool(&config, "claude", Some("gemini")),
+            None
+        );
+        assert_eq!(pinned_model_for_tool(&config, "opencode", None), None);
     }
 
     #[test]

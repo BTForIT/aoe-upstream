@@ -341,12 +341,10 @@ async fn admit_and_create(
         });
     }
 
-    // A profile pin (`acp.acp_defaults.<agent>.pin_model`) is authoritative
-    // for every session created under this profile. The spawn resolver
-    // (`resolve_spawn_model_effort`) applies it regardless, so refuse a
-    // request naming another model here, at the creation boundary, instead of
-    // recording that model as the session's explicit choice and silently
-    // launching the pin. Config resolution reads files; keep it off the
+    // Refuse a model off the profile pin at the creation boundary instead of
+    // recording it as the session's choice and silently launching the pin at
+    // spawn. The pin is keyed by the agent the session spawns as, see
+    // `pinned_model_for_tool`. Config resolution reads files; keep it off the
     // runtime thread like the canonicalization below.
     let requested_model = req
         .model_id
@@ -357,9 +355,11 @@ async fn admit_and_create(
         let profile = deps.profile.clone();
         let agent_id = req.agent_id.clone();
         let pinned = tokio::task::spawn_blocking(move || {
-            crate::session::config::profile_config::resolve_config_or_warn(&profile)
-                .acp
-                .pinned_model_for(&agent_id)
+            crate::acp::pinned_model_for_tool(
+                &crate::session::config::profile_config::resolve_config_or_warn(&profile),
+                &agent_id,
+                None,
+            )
         })
         .await
         .map_err(|e| DispatchError::internal(format!("resolve profile config: {e}")))?;
@@ -899,6 +899,50 @@ mod tests {
             assert_ne!(kind(&err), "model_pinned", "{params}");
             assert!(err.message.contains("project_path"), "{}", err.message);
         }
+    }
+
+    /// The pin is keyed by the agent a session spawns as. A wrapper that
+    /// `agent_detect_as` maps to a base agent runs the base adapter, so its
+    /// creation reads the base agent's pin, the same entry the spawn resolver
+    /// applies.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_reads_the_pin_of_the_agent_a_wrapper_spawns() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let config_path = crate::session::get_app_dir()
+            .expect("isolated app dir")
+            .join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[session.agent_detect_as]\nmy-claude = \"claude\"\n\n\
+             [acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
+        )
+        .expect("write pinned config");
+        // The wrapper is admitted like any agent that has run once: through
+        // the option catalog. Its default mode is unreviewed, so the request
+        // also needs the unattended grant to reach the pin gate.
+        crate::acp::option_catalog::record("my-claude", &[], "2026-01-01T00:00:00Z".into())
+            .expect("seed catalog");
+        let (deps, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.create", "session.unattended"]);
+
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "sessions.create",
+            &serde_json::json!({
+                "agent_id": "my-claude",
+                "project_path": "/tmp",
+                "model_id": "claude-other",
+            }),
+        )
+        .await
+        .expect_err("a model off the base agent's pin must be refused");
+        assert_eq!(kind(&err), "model_pinned", "{}", err.message);
+        let data = err.data.expect("typed error data");
+        assert_eq!(data["agent_id"], "my-claude");
+        assert_eq!(data["pinned_model"], "claude-pinned");
     }
 
     /// A registry-unknown `agent_id` never spawns anything (the probe bails on

@@ -258,15 +258,19 @@ pub(crate) async fn spawn_structured_session(
                 instance.import_pending = Some(true);
             }
             instance.agent_name = agent_name;
-            let agent_key = instance
-                .agent_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(instance.tool.as_str())
-                .to_string();
             let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
+            );
+            let acp_registry = crate::acp::AgentRegistry::with_defaults();
+            // The defaults, and the pin, are keyed by the agent the spawn
+            // runs, resolved the way the supervisor resolves it.
+            let agent_key = crate::acp::pick_acp_agent_name(
+                &acp_registry,
+                &resolved_config.session,
+                &resolved_config.acp,
+                &instance.tool,
+                instance.agent_name.as_deref(),
             );
             let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
             // Preserve the explicit request model separately (trimmed to match
@@ -307,18 +311,12 @@ pub(crate) async fn spawn_structured_session(
             // agent without an `agent_acp_cmd` (or any non-ACP tool)
             // falls back to tmux here rather than erroring at spawn time.
             if instance.is_structured() {
-                let acp_registry = crate::acp::AgentRegistry::with_defaults();
                 let resolved = instance
                     .agent_name
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
-                let resolved_session =
-                    crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                        &instance.source_profile,
-                        std::path::Path::new(&instance.project_path),
-                    )
-                    .session;
+                let resolved_session = &resolved_config.session;
                 // Check the resolved agent key AND the raw tool, the same pair
                 // `aoe add`'s precondition uses. Checking only `tool` for the
                 // `agent_acp_cmd` / inheritance legs downgraded a session that

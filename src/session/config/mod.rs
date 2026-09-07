@@ -1488,15 +1488,14 @@ pub struct AcpAgentDefaults {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
-    /// Make `model` a pin instead of a default. Off (the default), `model`
-    /// only fills in when a request names none and an explicit request wins.
-    /// On, every structured-view spawn for this agent runs on `model`:
-    /// [`resolve_spawn_model_effort`] replaces any other value, plugin
-    /// `sessions.create` refuses one (`model_pinned`), and the plugin settings
-    /// model picker offers only the pin. Governs creation and (re)spawn; a
-    /// running session's live model switch is a separate control. Meaningless
-    /// without a non-empty `model`. Global/profile only, like the rest of
-    /// `acp`: a repo config cannot set or clear it.
+    /// Make `model` a pin instead of a default. Off, `model` fills in only
+    /// when a request names none. On, every structured-view spawn of this
+    /// agent runs on `model`: [`resolve_spawn_model_effort`] replaces any
+    /// other value at creation and respawn, plugin `sessions.create` refuses
+    /// one (`model_pinned`), and the plugin settings model picker offers only
+    /// the pin. A running session's live model switch is separate. Meaningless
+    /// without a non-empty `model`; global/profile only, like the rest of
+    /// `acp`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pin_model: bool,
 
@@ -1585,29 +1584,24 @@ impl AcpConfig {
             .filter(|defaults| !defaults.is_empty())
     }
 
-    /// The model `agent` is pinned to, if its structured-view entry sets
-    /// `pin_model` with a non-empty `model`. The one source every creation
-    /// surface (spawn resolver, plugin `sessions.create`, the settings model
-    /// picker) reads the pin from; see [`AcpAgentDefaults::pinned_model`].
+    /// The model `agent` is pinned to (`pin_model` with a non-empty `model`).
+    /// `agent` is the key the session spawns as; a creation surface resolves
+    /// it through `crate::acp::pinned_model_for_tool`.
     pub fn pinned_model_for(&self, agent: &str) -> Option<String> {
         self.acp_defaults_for(agent)
             .and_then(|defaults| defaults.pinned_model())
     }
 }
 
-/// Resolve the model + effort a structured-view spawn should use. A pinned
-/// model (`pin_model`) wins over everything; otherwise an explicit per-request
-/// value (trimmed, non-empty) wins, and the per-agent structured-view default
-/// fills an absent one. Effort is keyed on the resolved model so a per-model
-/// override in `effort_by_model` applies to a defaulted or pinned model too;
-/// the pin is on the model only, so an explicit effort is still honored.
+/// Resolve the model + effort a structured-view spawn uses. A pin wins over
+/// everything; otherwise an explicit request (trimmed, non-empty) wins and the
+/// per-agent default fills an absent one. Effort is keyed on the resolved
+/// model so `effort_by_model` applies to a defaulted or pinned model too; the
+/// pin is on the model only, so an explicit effort is still honored.
 ///
-/// Single source for every spawn path (CLI create, reconciler respawn, web
-/// and plugin create); see `AcpConfig::acp_defaults_for`. Because the pin is
-/// applied here, a request carrying another model (a stored plugin setting
-/// that predates the pin, a persisted `agent_model` on respawn) cannot launch
-/// off it through any of those paths; plugin `sessions.create` additionally
-/// refuses such a request up front so the caller learns about the pin.
+/// Single source for every spawn path (CLI create, respawn, web and plugin
+/// create), so a request carrying another model cannot launch off the pin;
+/// plugin `sessions.create` additionally refuses such a request up front.
 pub fn resolve_spawn_model_effort(
     defaults: Option<&AcpAgentDefaults>,
     req_model: Option<String>,
