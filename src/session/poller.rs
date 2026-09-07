@@ -19,7 +19,7 @@ pub const DEFAULT_SESSION_ID_POLLER_MAX_THREADS: u32 = 50;
 /// A budget of session-id poller threads: how many are running and the
 /// ceiling they may not exceed.
 ///
-/// One instance serves the whole process ([`PROCESS_BUDGET`]); tests that
+/// One instance serves the whole process (`PROCESS_BUDGET`); tests that
 /// assert exact counts pin a private one (`test_support::IsolatedBudget`)
 /// so they neither observe nor disturb pollers started elsewhere.
 #[derive(Debug)]
@@ -477,11 +477,11 @@ impl SessionPoller {
         let _guard = match self.budget.try_acquire() {
             Some(g) => g,
             None => {
+                // The caller's repair schedule owns the warning and throttles
+                // it; warning here too would fire on every deferred attempt.
                 let (active, max) = (self.budget.active(), self.budget.max());
-                tracing::warn!(target: "session.create",
-                    "Session-id poller budget exhausted ({}/{}), skipping poller for {}; \
-                     its session id will not refresh until another session stops \
-                     (raise [session] session_id_poller_max_threads for larger fleets)",
+                tracing::debug!(target: "session.create",
+                    "Session-id poller budget exhausted ({}/{}), skipping poller for {}",
                     active,
                     max,
                     instance_id,
@@ -778,6 +778,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::sync::{Arc, Mutex, MutexGuard};
+    use tracing_test::traced_test;
 
     fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         mutex
@@ -1224,6 +1225,37 @@ mod tests {
             poller.cmd_rx.is_some(),
             "cmd_rx should be returned when budget exhausted"
         );
+    }
+
+    /// The repair path (`defer_poller_repair`) owns the exhausted-budget
+    /// warning and throttles it; `start` itself must stay below WARN or
+    /// every deferred attempt at the cap warns again.
+    #[traced_test]
+    #[test]
+    fn test_budget_exhaustion_leaves_the_warning_to_the_repair_path() {
+        tracing::callsite::rebuild_interest_cache();
+        let _budget = test_support::IsolatedBudget::exhausted();
+
+        let mut poller = SessionPoller::new("test-session".to_string());
+        let outcome = poller.start(
+            "test-budget-quiet".to_string(),
+            Box::new(|| Some("id".to_string())),
+            Box::new(|_| {}),
+            None,
+        );
+        assert_eq!(outcome, PollerSpawn::BudgetExhausted);
+
+        logs_assert(|lines: &[&str]| {
+            let warned = lines
+                .iter()
+                .filter(|l| l.contains("WARN"))
+                .filter(|l| l.contains("test-budget-quiet"))
+                .count();
+            match warned {
+                0 => Ok(()),
+                n => Err(format!("start warned {n} time(s) on an exhausted budget")),
+            }
+        });
     }
 
     #[test]
