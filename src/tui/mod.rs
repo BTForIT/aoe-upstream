@@ -231,6 +231,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         return remote_home::run_standalone(endpoint).await;
     }
 
+    // Opening the local session store creates the profile directory, so an
+    // unknown name is refused first (#148); the remote client above never
+    // touches local profiles.
+    crate::session::require_known_profile(profile)?;
+
     // Run pending migrations with a spinner that names the migration, its
     // current step and the elapsed time, and keeps the notices a migration
     // emits (what is being moved, how to defer it) on screen. Unconditional
