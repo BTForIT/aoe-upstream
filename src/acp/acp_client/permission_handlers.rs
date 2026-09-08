@@ -11,7 +11,7 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome,
 };
-use agent_client_protocol::Responder;
+
 use tokio::sync::{mpsc, oneshot};
 use tracing::{trace, warn};
 
@@ -138,12 +138,11 @@ pub(super) async fn emit_permission_denied(
 
 pub(super) async fn handle_permission_request(
     request: RequestPermissionRequest,
-    responder: Responder<RequestPermissionResponse>,
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
     profile: &'static agent_profiles::AgentProfile,
     tool_context_cache: ToolContextCache,
-) -> agent_client_protocol::Result<()> {
+) -> Result<RequestPermissionResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     let tool_call_id = request.tool_call.tool_call_id.0.to_string();
     trace!(
@@ -229,14 +228,14 @@ pub(super) async fn handle_permission_request(
             outcome = "receiver_gone",
             "ACP request handler exited"
         );
-        return responder.respond(RequestPermissionResponse::new(
+        return Ok(RequestPermissionResponse::new(
             RequestPermissionOutcome::Cancelled,
         ));
     }
 
     // Issue #1147: this `await` is the suspected serializer for the user-felt
     // slowness. Log the moment we begin awaiting so a wall-clock comparison
-    // with later "responder.respond" emissions exposes how long each pending
+    // with later "responding to permission request" emissions exposes how
     // approval blocked the agent's turn.
     let await_enter_ns = enter_timestamp_ns();
     trace!(
@@ -327,7 +326,7 @@ pub(super) async fn handle_permission_request(
         outcome = outcome_label,
         "responding to permission request"
     );
-    responder.respond(RequestPermissionResponse::new(outcome))
+    Ok(RequestPermissionResponse::new(outcome))
 }
 
 /// Handle an `elicitation/create` request (claude-agent-acp's
@@ -339,10 +338,9 @@ pub(super) async fn handle_permission_request(
 /// response so the agent's turn never hangs.
 pub(super) async fn handle_elicitation_request(
     request: CreateElicitationRequest,
-    responder: Responder<CreateElicitationResponse>,
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
-) -> agent_client_protocol::Result<()> {
+) -> Result<CreateElicitationResponse, agent_client_protocol::Error> {
     let nonce = Nonce::new();
     let elicitation = match parse_elicitation(nonce.clone(), &request, chrono::Utc::now()) {
         Ok(elicitation) => elicitation,
@@ -354,7 +352,7 @@ pub(super) async fn handle_elicitation_request(
             // request could not be presented. Either way the turn does not
             // hang on a card we'll never show.
             warn!(target: "acp.protocol", "unsupported elicitation, cancelling: {e}");
-            return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+            return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
     };
 
@@ -377,7 +375,7 @@ pub(super) async fn handle_elicitation_request(
         .is_err()
     {
         pending.lock().await.remove(&nonce);
-        return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+        return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
     }
 
     // Await the user's answer. `resolve_elicitation` validates server-side
@@ -404,7 +402,7 @@ pub(super) async fn handle_elicitation_request(
         })
         .await;
 
-    responder.respond(response)
+    Ok(response)
 }
 
 #[cfg(test)]
