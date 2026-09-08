@@ -76,7 +76,7 @@ impl CopyState {
 /// `announce` lets the fallback probe say once, per pass, that the runtime
 /// could not be asked; the per-startup reconcile passes `false` so a machine
 /// whose runtime is down is not told the same thing on every command.
-fn batched_running_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
+pub(crate) fn batched_running_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
     batched_running_probe_with(
         crate::containers::batch_container_states,
         probe_container_running,
@@ -94,7 +94,7 @@ thread_local! {
 /// so its next answer asks the runtime again. Publishing calls this because
 /// the copy before it ran without the transition lock, and a container may
 /// have come up meanwhile.
-fn refresh_liveness() {
+pub(crate) fn refresh_liveness() {
     LIVENESS_EPOCH.with(|epoch| epoch.set(epoch.get() + 1));
 }
 
@@ -106,9 +106,32 @@ fn refresh_liveness() {
 /// it; a transitional or unrecognised state is inspected rather than read as
 /// stopped, so a new runtime state can only cost a subprocess, never a copy
 /// out from under a live agent.
-fn batched_running_probe_with(
+pub(crate) fn batched_running_probe_with(
     batch: impl Fn() -> std::collections::HashMap<String, crate::containers::ContainerState>,
     inspect: impl Fn(&str) -> Result<(bool, bool)>,
+    announce: bool,
+) -> impl Fn(&str) -> Result<bool> {
+    batched_probe_with(
+        batch,
+        crate::containers::ContainerState::is_live,
+        inspect,
+        "checking which sandbox containers are running",
+        announce,
+    )
+}
+
+/// [`batched_running_probe_with`] over an arbitrary reading of a listed state.
+///
+/// A caller that asks a different question of the same listing reuses the
+/// batching and the fail-closed inspect fallback without changing what the
+/// migration asks. `listed` answers for a state the listing reported; `None`
+/// falls through to `inspect`, which is the only path that can distinguish
+/// "absent" from "could not be asked".
+pub(crate) fn batched_probe_with(
+    batch: impl Fn() -> std::collections::HashMap<String, crate::containers::ContainerState>,
+    listed: impl Fn(crate::containers::ContainerState) -> Option<bool>,
+    inspect: impl Fn(&str) -> Result<(bool, bool)>,
+    step: &'static str,
     announce: bool,
 ) -> impl Fn(&str) -> Result<bool> {
     let snapshot: std::cell::RefCell<
@@ -122,7 +145,7 @@ fn batched_running_probe_with(
         let epoch = LIVENESS_EPOCH.with(std::cell::Cell::get);
         let mut snapshot = snapshot.borrow_mut();
         if !matches!(&*snapshot, Some((at, _)) if *at == epoch) {
-            progress::step("checking which sandbox containers are running");
+            progress::step(step);
             *snapshot = Some((epoch, batch()));
         }
         let listed = snapshot
@@ -130,7 +153,7 @@ fn batched_running_probe_with(
             .and_then(|(_, states)| {
                 states.get(&crate::containers::DockerContainer::generate_name(id))
             })
-            .and_then(|state| state.is_live());
+            .and_then(|state| listed(*state));
         drop(snapshot);
         if let Some(live) = listed {
             return Ok(live);
@@ -164,7 +187,7 @@ fn probe_container_running(id: &str) -> Result<(bool, bool)> {
 
 /// Reports whether a migrated row's container is live. See
 /// [`probe_container_running`] for what an unreachable runtime answers.
-type RunningProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
+pub(crate) type RunningProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
 
 /// Reaps the stopped container of a row whose store has moved. `Ok(false)`
 /// leaves the row pending; see [`reap_migrated_container`].
@@ -182,7 +205,7 @@ type ReapProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
 /// later `aoe` invocation too. Callers substitute their own fail-closed answer
 /// and leave the row pending. A local I/O fault is a real failure and still
 /// propagates.
-fn runtime_cannot_answer(error: &crate::containers::error::DockerError) -> bool {
+pub(crate) fn runtime_cannot_answer(error: &crate::containers::error::DockerError) -> bool {
     use crate::containers::error::DockerError;
     matches!(
         error,
@@ -362,6 +385,32 @@ fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
                     || transition_paths(row).ok().flatten().is_some())
         }) {
             return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a row's store move is published but not yet finished, so its
+/// private store is being written.
+///
+/// Narrower than [`transition_may_be_pending`], which also answers yes for a
+/// row merely still on the shared store and for a journal naming a legacy root
+/// not yet retired. A parked row holds both of those for as long as it stays
+/// archived or trashed, so neither ever goes back to `false` and neither can
+/// gate a user-facing command. Both describe the legacy `sandbox` root, which
+/// no reclaim pass reads.
+pub(crate) fn transition_in_flight(app_dir: &Path) -> Result<bool> {
+    for registry in load_registries(app_dir)? {
+        let Some(rows) = registry.value.as_array() else {
+            continue;
+        };
+        // Not `.ok()`: metadata the migration cannot parse is state we cannot
+        // validate, and reading it as "no transition" would let a reclaim run
+        // against a store move it cannot see.
+        for row in rows {
+            if transition_paths(row)?.is_some() {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -1527,7 +1576,7 @@ fn load_registries(app_dir: &Path) -> Result<Vec<Registry>> {
     load_registry_paths(registry_paths(app_dir)?)
 }
 
-fn profile_for_registry(app_dir: &Path, path: &Path) -> String {
+pub(crate) fn profile_for_registry(app_dir: &Path, path: &Path) -> String {
     path.strip_prefix(app_dir.join("profiles"))
         .ok()
         .and_then(|relative| relative.components().next())
@@ -1536,7 +1585,7 @@ fn profile_for_registry(app_dir: &Path, path: &Path) -> String {
         .to_string()
 }
 
-fn instance_children(root: &Path) -> Result<BTreeSet<std::ffi::OsString>> {
+pub(crate) fn instance_children(root: &Path) -> Result<BTreeSet<std::ffi::OsString>> {
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => bail!(
@@ -2304,6 +2353,45 @@ mod tests {
         }
         assert_eq!(batches.get(), 1, "one listing per pass");
         assert_eq!(*inspected.borrow(), ["removing", "missing"]);
+    }
+
+    /// A parked row keeps its shared store, and the journal keeps naming the
+    /// legacy root it holds, for as long as it stays archived. Neither says a
+    /// private store is being written, so neither may gate `aoe sandbox
+    /// reclaim`, which would otherwise refuse on such a machine forever.
+    #[test]
+    fn only_a_published_transition_counts_as_in_flight() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z"}]"#,
+        )
+        .unwrap();
+        fs::write(app.join(JOURNAL), br#"["/home/u/.claude/sandbox"]"#).unwrap();
+
+        assert!(transition_may_be_pending(&app).unwrap());
+        assert!(!transition_in_flight(&app).unwrap());
+
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"sandbox_store_transition_paths":[{"source":"/a","destination":"/b"}]}]"#,
+        )
+        .unwrap();
+
+        assert!(transition_in_flight(&app).unwrap());
+
+        // Metadata the migration cannot parse is state it cannot validate, so
+        // it fails rather than reading as "no transition" and letting a
+        // reclaim run against a move it cannot see.
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"sandbox_store_transition_paths":5}]"#,
+        )
+        .unwrap();
+
+        assert!(transition_in_flight(&app).is_err());
     }
 
     /// A machine whose container runtime is absent or unreachable must still
