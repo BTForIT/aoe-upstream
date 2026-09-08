@@ -311,9 +311,17 @@ example `~/.claude/sandbox`). Each one moves when you start it: AoE copies the
 shared store into that session's private directory, removes its stopped
 container so the next launch mounts the copy, and deletes the shared store once
 every session that used it has moved (the private copies are the data from then
-on). A large store takes a while, so the first start of a session is slower
-than usual; the TUI shows the copy's progress on its status line and opens the
-session once it is done, and a plain `aoe` start says how many sessions still
+on). For an agent whose sessions already had a private store of their own, the
+copy takes the shared store's top-level files, its credentials, config and
+state, and not its directories: caches, logs, plugin trees and conversation
+history belonging to no one session. Those stay where they are rather than
+being replicated into every session, so if any are left the shared store is
+kept rather than deleted and AoE names it when the move finishes; remove it
+yourself once you no longer want it. A store with nothing left in it is
+deleted as before. A large store takes a while, so the first start of a
+session is slower than usual; the TUI shows the copy's progress on its status
+line and opens the session once it is done, and a plain `aoe` start says how
+many sessions still
 have the move ahead of them. A session whose container is still running is
 skipped and moved on a later start, after it stops. Trashed and archived sessions stay on the shared
 store. Starting one moves it; restoring or unarchiving alone does not, so run
