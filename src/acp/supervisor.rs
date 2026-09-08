@@ -2824,15 +2824,33 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
-    /// Resolve a pending approval.
+    /// Resolve a pending approval. `option_id` names an option off the
+    /// agent's own labels; `None` picks by option kind.
     pub async fn resolve_permission(
         &self,
         session_id: &str,
         nonce: Nonce,
         decision: ApprovalDecision,
+        option_id: Option<String>,
     ) -> Result<(), SupervisorError> {
         let client = self.client_for_session(session_id).await?;
-        client.resolve_permission(nonce, decision).await?;
+        client
+            .resolve_permission(nonce, decision, option_id)
+            .await?;
+        Ok(())
+    }
+
+    /// Cancel a pending approval: the user dismissed the card without
+    /// answering it. Distinct from `Deny`, which answers with a reject
+    /// option; a dismissal must never be mapped onto an option, so it
+    /// takes the resolver's cancellation path instead. See #3741.
+    pub async fn cancel_permission(
+        &self,
+        session_id: &str,
+        nonce: Nonce,
+    ) -> Result<(), SupervisorError> {
+        let client = self.client_for_session(session_id).await?;
+        client.cancel_permission(nonce).await?;
         Ok(())
     }
 
