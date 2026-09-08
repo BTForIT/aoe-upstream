@@ -25,7 +25,7 @@ pub use status_detection::{
 };
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
-pub use utils::tmux_prefix_display;
+pub use utils::{attach_return_hint, tmux_prefix_display};
 
 /// OSC 8 hyperlinks the live VT channel for `session` has seen, oldest first.
 /// Always empty off unix, where there is no channel and the capture fallback
