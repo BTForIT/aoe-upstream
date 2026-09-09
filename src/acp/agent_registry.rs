@@ -335,18 +335,27 @@ mod tests {
     #[test]
     fn pick_acp_agent_name_resolves_the_agent_a_spawn_runs() {
         let registry = AgentRegistry::with_defaults();
-        let mut session = crate::session::config::SessionConfig::default();
-        session
-            .agent_detect_as
-            .insert("my-claude".into(), "claude".into());
-        session
-            .agent_detect_as
-            .insert("my-cursor".into(), "cursor".into());
-        session
-            .agent_acp_cmd
-            .insert("oc-sp".into(), "ocp run sp acp".into());
-        let mut acp = crate::session::config::AcpConfig::default();
-        acp.default_agent = "opencode".into();
+        let session = crate::session::config::SessionConfig {
+            agent_detect_as: [
+                ("my-claude".to_string(), "claude".to_string()),
+                ("my-cursor".to_string(), "cursor".to_string()),
+                // A wrapper with a malformed command: the key must be
+                // rejected the same way the supervisor rejects it, so the
+                // defaults resolve for the base agent instead.
+                ("bad-sp".to_string(), "claude".to_string()),
+            ]
+            .into(),
+            agent_acp_cmd: [
+                ("oc-sp".to_string(), "ocp run sp acp".to_string()),
+                ("bad-sp".to_string(), String::new()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let acp = crate::session::config::AcpConfig {
+            default_agent: "opencode".into(),
+            ..Default::default()
+        };
 
         for (tool, explicit, want) in [
             ("claude", Some("gemini"), "gemini"),
@@ -357,6 +366,9 @@ mod tests {
             ("my-cursor", None, "opencode"),
             ("claude", None, "claude"),
             ("unknown", None, "opencode"),
+            // A malformed wrapper command must not claim the tool key: the
+            // detect_as base runs and its defaults apply.
+            ("bad-sp", None, "claude"),
         ] {
             assert_eq!(
                 pick_acp_agent_name(&registry, &session, &acp, tool, explicit),
