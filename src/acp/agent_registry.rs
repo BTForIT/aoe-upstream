@@ -276,7 +276,17 @@ pub fn pick_acp_agent_name(
     if registry.get(tool).is_some() {
         return tool.to_string();
     }
-    if session.agent_acp_cmd.contains_key(tool) {
+    // A malformed or empty `agent_acp_cmd` is not a usable ACP agent:
+    // selecting the tool key here would leave the supervisor falling back
+    // to `agent_detect_as`'s base (e.g. claude), whose defaults then apply
+    // while the creation path resolved the wrapper's. Reject the key the
+    // same way the supervisor does, so both sides agree the wrapper is
+    // invalid and defaults resolve for the base agent.
+    if session
+        .agent_acp_cmd
+        .get(tool)
+        .is_some_and(|cmd| AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+    {
         return tool.to_string();
     }
     if let Some(base) = inherited_acp_base(tool, &session.agent_detect_as) {
